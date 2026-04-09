@@ -4,44 +4,64 @@ const axios = require("axios");
 const app = express();
 app.use(express.json());
 
-app.post("/webhook", async (req, res) => {
-  const event = req.body.events[0];
-
-  if (event.type !== "message") return res.sendStatus(200);
-
-  const userMsg = event.message.text;
-
-  const claude = await axios.post(
-    "https://api.anthropic.com/v1/messages",
-    {
-      model: "claude-3-haiku-20240307",
-      max_tokens: 500,
-      messages: [{ role: "user", content: userMsg }]
-    },
-    {
-      headers: {
-        "x-api-key": process.env.CLAUDE_API_KEY,
-        "anthropic-version": "2023-06-01"
-      }
-    }
-  );
-
-  const reply = claude.data.content[0].text;
-
-  await axios.post(
-    "https://api.line.me/v2/bot/message/reply",
-    {
-      replyToken: event.replyToken,
-      messages: [{ type: "text", text: reply }]
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.LINE_TOKEN}`
-      }
-    }
-  );
-
-  res.sendStatus(200);
+app.get("/", (req, res) => {
+  res.send("Bot is running");
 });
 
-app.listen(process.env.PORT || 3000);
+app.get("/webhook", (req, res) => {
+  res.send("Webhook endpoint is alive");
+});
+
+app.post("/webhook", async (req, res) => {
+  try {
+    const event = req.body.events?.[0];
+
+    if (!event || event.type !== "message" || event.message?.type !== "text") {
+      return res.sendStatus(200);
+    }
+
+    const userMsg = event.message.text;
+
+    const claude = await axios.post(
+      "https://api.anthropic.com/v1/messages",
+      {
+        model: "claude-3-haiku-20240307",
+        max_tokens: 300,
+        messages: [{ role: "user", content: userMsg }]
+      },
+      {
+        headers: {
+          "x-api-key": process.env.CLAUDE_API_KEY,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json"
+        }
+      }
+    );
+
+    const reply = claude.data.content?.[0]?.text || "No response";
+
+    await axios.post(
+      "https://api.line.me/v2/bot/message/reply",
+      {
+        replyToken: event.replyToken,
+        messages: [{ type: "text", text: reply }]
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.LINE_TOKEN}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    res.sendStatus(200);
+  } catch (error) {
+    console.error("Webhook error:", error.response?.data || error.message);
+    res.sendStatus(200);
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
