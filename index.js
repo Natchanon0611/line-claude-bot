@@ -13,13 +13,15 @@ app.get("/webhook", (req, res) => {
 });
 
 app.post("/webhook", async (req, res) => {
+  const event = req.body.events?.[0];
+
+  console.log("EVENT =", JSON.stringify(req.body));
+
+  if (!event || event.type !== "message" || event.message?.type !== "text") {
+    return res.sendStatus(200);
+  }
+
   try {
-    const event = req.body.events?.[0];
-
-    if (!event || event.type !== "message" || event.message?.type !== "text") {
-      return res.sendStatus(200);
-    }
-
     const userMsg = event.message.text;
 
     const claude = await axios.post(
@@ -44,7 +46,7 @@ app.post("/webhook", async (req, res) => {
       "https://api.line.me/v2/bot/message/reply",
       {
         replyToken: event.replyToken,
-        messages: [{ type: "text", text: reply }]
+        messages: [{ type: "text", text: reply.slice(0, 1000) }]
       },
       {
         headers: {
@@ -57,6 +59,39 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(200);
   } catch (error) {
     console.error("Webhook error:", error.response?.data || error.message);
+
+    let errorMessage = "เกิดข้อผิดพลาดในการใช้งานบอท";
+
+    const apiError = error.response?.data?.error?.message;
+    const normalError = error.response?.data?.message;
+    const fallbackError = error.message;
+
+    if (apiError) {
+      errorMessage = `Error: ${apiError}`;
+    } else if (normalError) {
+      errorMessage = `Error: ${normalError}`;
+    } else if (fallbackError) {
+      errorMessage = `Error: ${fallbackError}`;
+    }
+
+    try {
+      await axios.post(
+        "https://api.line.me/v2/bot/message/reply",
+        {
+          replyToken: event.replyToken,
+          messages: [{ type: "text", text: errorMessage.slice(0, 1000) }]
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.LINE_TOKEN}`,
+            "Content-Type": "application/json"
+          }
+        }
+      );
+    } catch (replyError) {
+      console.error("Reply error:", replyError.response?.data || replyError.message);
+    }
+
     res.sendStatus(200);
   }
 });
