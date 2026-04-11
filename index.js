@@ -13,11 +13,12 @@ app.get("/webhook", (req, res) => {
 });
 
 app.post("/webhook", async (req, res) => {
-  const event = req.body.events?.[0];
+  const events = req.body && req.body.events ? req.body.events : [];
+  const event = events[0];
 
   console.log("EVENT =", JSON.stringify(req.body));
 
-  if (!event || event.type !== "message" || event.message?.type !== "text") {
+  if (!event || event.type !== "message" || !event.message || event.message.type !== "text") {
     return res.sendStatus(200);
   }
 
@@ -40,13 +41,19 @@ app.post("/webhook", async (req, res) => {
       }
     );
 
-    const reply = claude.data.content?.[0]?.text || "No response";
+    const reply =
+      claude.data &&
+      claude.data.content &&
+      claude.data.content[0] &&
+      claude.data.content[0].text
+        ? claude.data.content[0].text
+        : "No response";
 
     await axios.post(
       "https://api.line.me/v2/bot/message/reply",
       {
         replyToken: event.replyToken,
-        messages: [{ type: "text", text: reply.slice(0, 1000) }]
+        messages: [{ type: "text", text: String(reply).slice(0, 1000) }]
       },
       {
         headers: {
@@ -56,14 +63,23 @@ app.post("/webhook", async (req, res) => {
       }
     );
 
-    res.sendStatus(200);
+    return res.sendStatus(200);
   } catch (error) {
-    console.error("Webhook error:", error.response?.data || error.message);
+    console.error("Webhook error:", error.response ? error.response.data : error.message);
 
     let errorMessage = "เกิดข้อผิดพลาดในการใช้งานบอท";
 
-    const apiError = error.response?.data?.error?.message;
-    const normalError = error.response?.data?.message;
+    const apiError =
+      error.response &&
+      error.response.data &&
+      error.response.data.error &&
+      error.response.data.error.message;
+
+    const normalError =
+      error.response &&
+      error.response.data &&
+      error.response.data.message;
+
     const fallbackError = error.message;
 
     if (apiError) {
@@ -89,10 +105,10 @@ app.post("/webhook", async (req, res) => {
         }
       );
     } catch (replyError) {
-      console.error("Reply error:", replyError.response?.data || replyError.message);
+      console.error("Reply error:", replyError.response ? replyError.response.data : replyError.message);
     }
 
-    res.sendStatus(200);
+    return res.sendStatus(200);
   }
 });
 
