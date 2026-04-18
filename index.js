@@ -52,6 +52,22 @@ async function linePushImage(to, imageUrl, altText) {
   );
 }
 
+async function lineBroadcast(text) {
+  await axios.post(
+    "https://api.line.me/v2/bot/message/broadcast",
+    { messages: [{ type: "text", text: String(text).substring(0, 2000) }] },
+    { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
+  );
+}
+
+async function lineBroadcastImage(imageUrl) {
+  await axios.post(
+    "https://api.line.me/v2/bot/message/broadcast",
+    { messages: [{ type: "image", originalContentUrl: imageUrl, previewImageUrl: imageUrl }] },
+    { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
+  );
+}
+
 // ─────────────────────────────────────────────
 //  PO Sign Command Handler
 // ─────────────────────────────────────────────
@@ -172,14 +188,14 @@ app.post("/notify-new-po", async (req, res) => {
   }
 
   try {
-    await linePush(lastLineSource, `📨 มี PO ใหม่เข้ามาครับ\n📄 ${filename}`);
+    await lineBroadcast(`📨 มี PO ใหม่เข้ามาครับ\n📄 ${filename}`);
 
     if (image_b64) {
       const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
       imageStore.set(id, image_b64);
       setTimeout(() => imageStore.delete(id), 10 * 60 * 1000);
       const imageUrl = `${RENDER_URL}/po-image/${id}`;
-      await linePushImage(lastLineSource, imageUrl, filename);
+      await lineBroadcastImage(imageUrl);
     }
 
     res.json({ status: "ok" });
