@@ -42,7 +42,6 @@ async function handlePOSign(event) {
 
   const userId = event.source.userId;
 
-  // ตอบรับทันที
   await lineReply(event.replyToken, "⏳ กำลังลงลายเซ็น PO อยู่ครับ รอสักครู่...");
 
   try {
@@ -95,11 +94,9 @@ app.post("/webhook", async (req, res) => {
 
   res.sendStatus(200); // ตอบ LINE ก่อนเสมอ
 
-  // ── ตรวจสอบว่าเป็นคำสั่ง sign PO ก่อน ──
   const handled = await handlePOSign(event);
   if (handled) return;
 
-  // ── ถ้าไม่ใช่ → ส่งให้ Claude ตอบ ──
   try {
     const userMsg = event.message.text;
     const claude  = await axios.post(
