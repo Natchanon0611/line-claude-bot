@@ -101,17 +101,41 @@ async function handlePOSign(event) {
       await linePush(userId, "✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ");
 
     } else if (data.status === "success" && data.signed?.length > 0) {
-      const list = data.signed.map((f, i) => `${i + 1}. ${f.po_id}`).join("\n");
-      await linePush(userId, `✅ ลงลายเซ็น PO เสร็จแล้ว ${data.signed.length} ไฟล์\n\n${list}\n\n📅 วันที่: ${data.date}\n📂 บันทึกใน PO_Signed แล้วครับ`);
+      // เวลาปัจจุบัน (Bangkok)
+      const now = new Date().toLocaleString("th-TH", {
+        timeZone: "Asia/Bangkok",
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit"
+      });
 
-      // ส่งรูป PO ที่เซ็นแล้วทีละไฟล์
       for (const item of data.signed) {
+        // ข้อความอีเมลที่ส่งไป
+        const emailBody =
+          `Dear Sir/Madam,\n\n` +
+          `Please find the confirmed Purchase Order attached.\n\n` +
+          `PO No.: ${item.po_id}\n` +
+          `Date: ${item.date}\n\n` +
+          `Best regards,\nFES Group`;
+
+        const broadcastMsg =
+          `✅ เซ็น PO เสร็จแล้ว\n` +
+          `━━━━━━━━━━━━━━━\n` +
+          `📄 PO: ${item.po_id}\n` +
+          `📅 เวลา: ${now}\n` +
+          `✉️  ส่งอีเมลไปที่: ${item.email}\n` +
+          `📧 สถานะ: ${item.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
+          `━━━━━━━━━━━━━━━\n` +
+          `ข้อความที่ส่ง:\n${emailBody}`;
+
+        await lineBroadcast(broadcastMsg);
+
+        // ส่งรูป PO ที่เซ็นแล้ว
         if (item.image_b64) {
           const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
           imageStore.set(id, item.image_b64);
           setTimeout(() => imageStore.delete(id), 10 * 60 * 1000);
           const imageUrl = `${RENDER_URL}/po-image/${id}`;
-          await linePushImage(userId, imageUrl, item.po_id);
+          await lineBroadcastImage(imageUrl);
         }
       }
 
