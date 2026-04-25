@@ -137,6 +137,13 @@ async function handlePOSign(event) {
           ? `📋 ใบเสนอราคา: ${item.matched_quotation}\n`
           : "";
 
+        const nasLine   = item.nas_ok   ? "📂 NAS: คัดลอกแล้ว ✓\n"
+                        : item.nas_error ? `📂 NAS: ล้มเหลว ✗ (${item.nas_error})\n`
+                        : "";
+        const printLine = item.print_ok   ? "🖨️  ปริ้น: สั่งแล้ว ✓\n"
+                        : item.print_error ? `🖨️  ปริ้น: ล้มเหลว ✗ (${item.print_error})\n`
+                        : "";
+
         const broadcastMsg =
           `✅ เซ็น PO เสร็จแล้ว\n` +
           `━━━━━━━━━━━━━━━\n` +
@@ -145,7 +152,9 @@ async function handlePOSign(event) {
           `📅 เวลา: ${now}\n` +
           `👤 สั่งโดย: ${senderName}\n` +
           `✉️  ส่งอีเมลไปที่: ${item.email}\n` +
-          `📧 สถานะ: ${item.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
+          `📧 อีเมล: ${item.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
+          nasLine +
+          printLine +
           `━━━━━━━━━━━━━━━\n` +
           `ข้อความที่ส่ง:\n${emailBody}`;
 
@@ -165,9 +174,28 @@ async function handlePOSign(event) {
       await lineBroadcast("⚠️ " + (data.message || "เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ"));
     }
 
+    // แจ้งไฟล์ที่เซ็นไม่สำเร็จ
+    if (data.failed?.length > 0) {
+      for (const item of data.failed) {
+        await lineBroadcast(
+          `❌ เซ็น PO ไม่สำเร็จ\n` +
+          `━━━━━━━━━━━━━━━\n` +
+          `📄 ไฟล์: ${item.file}\n` +
+          `⚠️ สาเหตุ: ${item.error}\n` +
+          `━━━━━━━━━━━━━━━`
+        );
+      }
+    }
+
   } catch (err) {
     console.error("PO Sign error:", err.message);
-    await linePush(notifyId, "❌ เชื่อมต่อเครื่องไม่ได้ครับ\nตรวจสอบว่า Flask server และ ngrok รันอยู่");
+    await lineBroadcast(
+      `❌ เชื่อมต่อเครื่องไม่ได้\n` +
+      `━━━━━━━━━━━━━━━\n` +
+      `👤 สั่งโดย: ${senderName}\n` +
+      `⚠️ ตรวจสอบว่า Flask server และ ngrok รันอยู่\n` +
+      `━━━━━━━━━━━━━━━`
+    );
   }
 
   return true;
