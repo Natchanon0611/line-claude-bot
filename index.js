@@ -77,7 +77,21 @@ async function handlePOSign(event) {
   const text = (event.message?.text || "").trim().toLowerCase();
   if (!SIGN_COMMANDS.some(cmd => text.includes(cmd))) return false;
 
-  const userId = event.source.groupId || event.source.userId;
+  const userId     = event.source.userId;
+  const groupId    = event.source.groupId || null;
+  const notifyId   = groupId || userId;
+
+  // ดึงชื่อผู้สั่ง
+  let senderName = "ไม่ทราบชื่อ";
+  try {
+    const profile = await axios.get(
+      `https://api.line.me/v2/bot/profile/${userId}`,
+      { headers: { Authorization: `Bearer ${LINE_TOKEN}` } }
+    );
+    senderName = profile.data.displayName || senderName;
+  } catch (e) {
+    console.error("Get profile error:", e.message);
+  }
 
   await lineReply(event.replyToken, "⏳ กำลังลงลายเซ็น PO อยู่ครับ รอสักครู่...");
 
@@ -98,10 +112,9 @@ async function handlePOSign(event) {
     const data = res.data;
 
     if (data.status === "no_files") {
-      await linePush(userId, "✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ");
+      await lineBroadcast("✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ");
 
     } else if (data.status === "success" && data.signed?.length > 0) {
-      // เวลาปัจจุบัน (Bangkok)
       const now = new Date().toLocaleString("th-TH", {
         timeZone: "Asia/Bangkok",
         year: "numeric", month: "2-digit", day: "2-digit",
@@ -109,7 +122,6 @@ async function handlePOSign(event) {
       });
 
       for (const item of data.signed) {
-        // ข้อความอีเมลที่ส่งไป
         const emailBody =
           `Dear Sir/Madam,\n\n` +
           `Please find the confirmed Purchase Order attached.\n\n` +
@@ -127,12 +139,13 @@ async function handlePOSign(event) {
           `📄 PO: ${item.po_id}\n` +
           quotationLine +
           `📅 เวลา: ${now}\n` +
+          `👤 สั่งโดย: ${senderName}\n` +
           `✉️  ส่งอีเมลไปที่: ${item.email}\n` +
           `📧 สถานะ: ${item.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
           `━━━━━━━━━━━━━━━\n` +
           `ข้อความที่ส่ง:\n${emailBody}`;
 
-        await linePush(userId, broadcastMsg);
+        await lineBroadcast(broadcastMsg);
 
         // ส่งรูป PO ที่เซ็นแล้ว
         if (item.image_b64) {
@@ -140,17 +153,17 @@ async function handlePOSign(event) {
           imageStore.set(id, item.image_b64);
           setTimeout(() => imageStore.delete(id), 10 * 60 * 1000);
           const imageUrl = `${RENDER_URL}/po-image/${id}`;
-          await linePushImage(userId, imageUrl);
+          await lineBroadcastImage(imageUrl);
         }
       }
 
     } else {
-      await linePush(userId, "⚠️ " + (data.message || "เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ"));
+      await lineBroadcast("⚠️ " + (data.message || "เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ"));
     }
 
   } catch (err) {
     console.error("PO Sign error:", err.message);
-    await linePush(userId, "❌ เชื่อมต่อเครื่องไม่ได้ครับ\nตรวจสอบว่า Flask server และ ngrok รันอยู่");
+    await linePush(notifyId, "❌ เชื่อมต่อเครื่องไม่ได้ครับ\nตรวจสอบว่า Flask server และ ngrok รันอยู่");
   }
 
   return true;
