@@ -94,6 +94,7 @@ async function handlePOSign(event) {
   }
 
   await lineReply(event.replyToken, "⏳ กำลังลงลายเซ็น PO อยู่ครับ รอสักครู่...");
+  await lineBroadcast(`⏳ กำลังลงลายเซ็น PO\n👤 สั่งโดย: ${senderName}`);
 
   try {
     const res = await axios.post(
@@ -111,7 +112,10 @@ async function handlePOSign(event) {
 
     const data = res.data;
 
-    if (data.status === "no_files") {
+    if (data.status === "busy") {
+      await lineBroadcast(`⚠️ กำลังลงลายเซ็นอยู่แล้วครับ\n👤 สั่งโดย: ${senderName}\nรอให้เสร็จก่อนแล้วค่อยสั่งใหม่`);
+
+    } else if (data.status === "no_files") {
       await lineBroadcast("✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ");
 
     } else if (data.status === "success" && data.signed?.length > 0) {
