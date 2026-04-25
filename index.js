@@ -289,7 +289,8 @@ app.post("/webhook", async (req, res) => {
       }
     );
     const reply = claude.data.content[0].text || "No response";
-    await linePush(lastLineSource, reply.substring(0, 1000));
+    const replyTarget = lastLineSource || event.source.groupId || event.source.userId;
+    await linePush(replyTarget, reply.substring(0, 1000));
   } catch (error) {
     console.error("Claude ERROR =", error.response?.data || error.message);
   }
