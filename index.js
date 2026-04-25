@@ -391,6 +391,9 @@ async function handlePOPrint(event) {
 app.get("/", (req, res) => res.send("Bot is running"));
 app.get("/webhook", (req, res) => res.send("Webhook endpoint is alive"));
 
+// Deduplication — ป้องกัน LINE retry ส่ง webhook ซ้ำ
+const processedMsgIds = new Set();
+
 // LINE Webhook
 app.post("/webhook", async (req, res) => {
   const events = req.body.events || [];
@@ -401,6 +404,15 @@ app.post("/webhook", async (req, res) => {
   if (!event || event.type !== "message" || event.message.type !== "text") {
     return res.sendStatus(200);
   }
+
+  // ตรวจ duplicate message ID
+  const msgId = event.message.id;
+  if (processedMsgIds.has(msgId)) {
+    console.log(`Duplicate message ignored: ${msgId}`);
+    return res.sendStatus(200);
+  }
+  processedMsgIds.add(msgId);
+  setTimeout(() => processedMsgIds.delete(msgId), 5 * 60 * 1000); // ลบหลัง 5 นาที
 
   // บันทึก source ID สำหรับ push notification
   lastLineSource = event.source.groupId || event.source.userId;
