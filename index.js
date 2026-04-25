@@ -117,17 +117,22 @@ async function handlePOSign(event) {
           `Date: ${item.date}\n\n` +
           `Best regards,\nFES Group`;
 
+        const quotationLine = item.matched_quotation
+          ? `📋 ใบเสนอราคา: ${item.matched_quotation}\n`
+          : "";
+
         const broadcastMsg =
           `✅ เซ็น PO เสร็จแล้ว\n` +
           `━━━━━━━━━━━━━━━\n` +
           `📄 PO: ${item.po_id}\n` +
+          quotationLine +
           `📅 เวลา: ${now}\n` +
           `✉️  ส่งอีเมลไปที่: ${item.email}\n` +
           `📧 สถานะ: ${item.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
           `━━━━━━━━━━━━━━━\n` +
           `ข้อความที่ส่ง:\n${emailBody}`;
 
-        await lineBroadcast(broadcastMsg);
+        await linePush(userId, broadcastMsg);
 
         // ส่งรูป PO ที่เซ็นแล้ว
         if (item.image_b64) {
@@ -135,7 +140,7 @@ async function handlePOSign(event) {
           imageStore.set(id, item.image_b64);
           setTimeout(() => imageStore.delete(id), 10 * 60 * 1000);
           const imageUrl = `${RENDER_URL}/po-image/${id}`;
-          await lineBroadcastImage(imageUrl);
+          await linePushImage(userId, imageUrl);
         }
       }
 
@@ -212,14 +217,14 @@ app.post("/notify-new-po", async (req, res) => {
   }
 
   try {
-    await lineBroadcast(`📨 มี PO ใหม่เข้ามาครับ\n📄 ${filename}`);
+    await linePush(lastLineSource, `📨 มี PO ใหม่เข้ามาครับ\n📄 ${filename}`);
 
     if (image_b64) {
       const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
       imageStore.set(id, image_b64);
       setTimeout(() => imageStore.delete(id), 10 * 60 * 1000);
       const imageUrl = `${RENDER_URL}/po-image/${id}`;
-      await lineBroadcastImage(imageUrl);
+      await linePushImage(lastLineSource, imageUrl);
     }
 
     res.json({ status: "ok" });
