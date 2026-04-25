@@ -157,6 +157,48 @@ async function handlePOSign(event) {
 }
 
 // ─────────────────────────────────────────────
+//  Print PO Command Handler
+// ─────────────────────────────────────────────
+const PRINT_COMMANDS = ["print po", "ปริ้น po", "ปริ้น", "print"];
+
+async function handlePOPrint(event) {
+  const text = (event.message?.text || "").trim().toLowerCase();
+  if (!PRINT_COMMANDS.some(cmd => text.includes(cmd))) return false;
+
+  const userId = event.source.groupId || event.source.userId;
+  await lineReply(event.replyToken, "🖨️ กำลังสั่งปริ้น PO ล่าสุด รอสักครู่...");
+
+  try {
+    const res = await axios.post(
+      `${PO_LOCAL_URL}/print-po`,
+      {},
+      {
+        headers: {
+          "X-PO-Secret": PO_SECRET,
+          "Content-Type": "application/json",
+          "ngrok-skip-browser-warning": "true"
+        },
+        timeout: 30000
+      }
+    );
+
+    const data = res.data;
+    if (data.status === "ok") {
+      await linePush(userId, `✅ สั่งปริ้นแล้วครับ\n📄 ${data.printed}`);
+    } else if (data.status === "no_files") {
+      await linePush(userId, "⚠️ ไม่มีไฟล์ใน PO_Signed ครับ");
+    } else {
+      await linePush(userId, "❌ ปริ้นไม่สำเร็จ: " + (data.error || "unknown"));
+    }
+  } catch (err) {
+    console.error("Print PO error:", err.message);
+    await linePush(userId, "❌ เชื่อมต่อเครื่องไม่ได้ครับ\nตรวจสอบว่า Flask server และ ngrok รันอยู่");
+  }
+
+  return true;
+}
+
+// ─────────────────────────────────────────────
 //  Routes
 // ─────────────────────────────────────────────
 app.get("/", (req, res) => res.send("Bot is running"));
@@ -180,6 +222,9 @@ app.post("/webhook", async (req, res) => {
 
   const handled = await handlePOSign(event);
   if (handled) return;
+
+  const printed = await handlePOPrint(event);
+  if (printed) return;
 
   // ── ส่งให้ Claude ตอบ ──
   try {
