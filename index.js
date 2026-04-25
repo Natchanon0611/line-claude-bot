@@ -15,8 +15,14 @@ const RENDER_URL  = "https://line-claude-bot-y1jo.onrender.com";
 // เก็บ source ID ล่าสุดสำหรับ push notification
 let lastLineSource = process.env.LINE_NOTIFY_TARGET || null;
 
-// เก็บรูปชั่วคราว (หมดอายุใน 10 นาที)
+// เก็บรูปชั่วคราว (หมดอายุใน 1 ชั่วโมง)
 const imageStore = new Map();
+
+// เก็บ PO ที่รอยืนยันลายเซ็น
+const pendingConfirmations = new Map(); // po_id → {email, po_id, signed_file, pending_file, date}
+
+// เก็บรายการ PO ที่รอให้ user เลือก
+let pendingSignList = null; // { files: [...], senderName }
 
 // ─────────────────────────────────────────────
 //  LINE Helpers
@@ -69,6 +75,79 @@ async function lineBroadcastImage(imageUrl) {
 }
 
 // ─────────────────────────────────────────────
+//  Process Sign Result (shared logic)
+// ─────────────────────────────────────────────
+async function processPOSignResult(data, senderName) {
+  if (data.status === "busy") {
+    await lineBroadcast(`⚠️ กำลังลงลายเซ็นอยู่แล้วครับ\n👤 สั่งโดย: ${senderName}\nรอให้เสร็จก่อนแล้วค่อยสั่งใหม่`);
+    return;
+  }
+  if (data.status === "no_files") {
+    await lineBroadcast("✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ");
+    return;
+  }
+  if (data.status !== "success" || !data.signed?.length) {
+    await lineBroadcast("⚠️ " + (data.message || "เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ"));
+  }
+
+  const now = new Date().toLocaleString("th-TH", {
+    timeZone: "Asia/Bangkok", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit"
+  });
+
+  for (const item of (data.signed || [])) {
+    if (item.needs_confirmation) {
+      pendingConfirmations.set(item.po_id, {
+        email: item.email, po_id: item.po_id,
+        signed_file: item.signed_file, pending_file: item.pending_file, date: item.date,
+      });
+      await lineBroadcast(
+        `⚠️ Claude หาตำแหน่งลายเซ็นไม่เจอ\n━━━━━━━━━━━━━━━\n` +
+        `📄 PO: ${item.po_id}\n👤 สั่งโดย: ${senderName}\n━━━━━━━━━━━━━━━\n` +
+        `ตรวจสอบรูปด้านล่าง แล้วตอบ:\n✅ "ยืนยัน" — ส่งเมล + ปริ้น\n❌ "ยกเลิก" — ลบและส่ง PO ใหม่`
+      );
+      if (item.image_b64) {
+        const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        imageStore.set(id, item.image_b64);
+        setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
+        await lineBroadcastImage(`${RENDER_URL}/po-image/${id}`);
+      }
+      continue;
+    }
+
+    const emailBody = `Dear Sir/Madam,\n\nPlease find the confirmed Purchase Order attached.\n\nPO No.: ${item.po_id}\nDate: ${item.date}\n\nBest regards,\nFES Group`;
+    const quotationLine = item.matched_quotation ? `📋 ใบเสนอราคา: ${item.matched_quotation}\n` : "";
+    const nasLine   = item.nas_ok    ? "📂 NAS: คัดลอกแล้ว ✓\n"
+                    : item.nas_error ? `📂 NAS: ล้มเหลว ✗ (${item.nas_error})\n` : "";
+    const printLine = item.print_ok    ? "🖨️  ปริ้น: สั่งแล้ว ✓\n"
+                    : item.print_error ? `🖨️  ปริ้น: ล้มเหลว ✗ (${item.print_error})\n` : "";
+
+    await lineBroadcast(
+      `✅ เซ็น PO เสร็จแล้ว\n━━━━━━━━━━━━━━━\n` +
+      `📄 PO: ${item.po_id}\n` + quotationLine +
+      `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
+      `✉️  ส่งอีเมลไปที่: ${item.email}\n` +
+      `📧 อีเมล: ${item.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
+      nasLine + printLine + `━━━━━━━━━━━━━━━\nข้อความที่ส่ง:\n${emailBody}`
+    );
+
+    if (item.image_b64) {
+      const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      imageStore.set(id, item.image_b64);
+      setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
+      await lineBroadcastImage(`${RENDER_URL}/po-image/${id}`);
+    }
+  }
+
+  for (const item of (data.failed || [])) {
+    await lineBroadcast(
+      `❌ เซ็น PO ไม่สำเร็จ\n━━━━━━━━━━━━━━━\n` +
+      `📄 ไฟล์: ${item.file}\n⚠️ สาเหตุ: ${item.error}\n━━━━━━━━━━━━━━━`
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
 //  PO Sign Command Handler
 // ─────────────────────────────────────────────
 const SIGN_COMMANDS = ["sign po", "เซ็น po", "sign", "ลงลายเซ็น", "confirm po", "เซ็น"];
@@ -93,13 +172,41 @@ async function handlePOSign(event) {
     console.error("Get profile error:", e.message);
   }
 
+  // ── ดึงรายการ PO ก่อน ──
+  let poFiles = [];
+  try {
+    const listRes = await axios.post(`${PO_LOCAL_URL}/list-po`, {},
+      { headers: { "X-PO-Secret": PO_SECRET, "Content-Type": "application/json",
+                   "ngrok-skip-browser-warning": "true" }, timeout: 15000 });
+    poFiles = listRes.data.files || [];
+  } catch (e) {
+    await lineBroadcast(`❌ เชื่อมต่อเครื่องไม่ได้\n👤 สั่งโดย: ${senderName}\nตรวจสอบว่า Flask และ ngrok รันอยู่`);
+    return true;
+  }
+
+  if (poFiles.length === 0) {
+    await lineReply(event.replyToken, "✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ");
+    return true;
+  }
+
+  // ถ้ามีไฟล์เดียว → เซ็นเลย / ถ้ามีหลายไฟล์ → ให้ user เลือก
+  if (poFiles.length > 1) {
+    pendingSignList = { files: poFiles, senderName };
+    const fileList = poFiles.map((f, i) => `${i + 1}. ${f}`).join("\n");
+    await lineReply(event.replyToken,
+      `📋 PO ที่รอลงลายเซ็น ${poFiles.length} ไฟล์\n━━━━━━━━━━━━━━━\n${fileList}\n━━━━━━━━━━━━━━━\nตอบเลขที่ต้องการเซ็น เช่น "1 3"\nหรือตอบ "ทั้งหมด"`
+    );
+    return true;
+  }
+
+  // ไฟล์เดียว → เซ็นเลย
   await lineReply(event.replyToken, "⏳ กำลังลงลายเซ็น PO อยู่ครับ รอสักครู่...");
   await lineBroadcast(`⏳ กำลังลงลายเซ็น PO\n👤 สั่งโดย: ${senderName}`);
 
   try {
     const res = await axios.post(
       `${PO_LOCAL_URL}/sign-po`,
-      { requested_by: userId },
+      { requested_by: userId, selected_files: poFiles },
       {
         headers: {
           "X-PO-Secret": PO_SECRET,
@@ -112,80 +219,7 @@ async function handlePOSign(event) {
 
     const data = res.data;
 
-    if (data.status === "busy") {
-      await lineBroadcast(`⚠️ กำลังลงลายเซ็นอยู่แล้วครับ\n👤 สั่งโดย: ${senderName}\nรอให้เสร็จก่อนแล้วค่อยสั่งใหม่`);
-
-    } else if (data.status === "no_files") {
-      await lineBroadcast("✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ");
-
-    } else if (data.status === "success" && data.signed?.length > 0) {
-      const now = new Date().toLocaleString("th-TH", {
-        timeZone: "Asia/Bangkok",
-        year: "numeric", month: "2-digit", day: "2-digit",
-        hour: "2-digit", minute: "2-digit"
-      });
-
-      for (const item of data.signed) {
-        const emailBody =
-          `Dear Sir/Madam,\n\n` +
-          `Please find the confirmed Purchase Order attached.\n\n` +
-          `PO No.: ${item.po_id}\n` +
-          `Date: ${item.date}\n\n` +
-          `Best regards,\nFES Group`;
-
-        const quotationLine = item.matched_quotation
-          ? `📋 ใบเสนอราคา: ${item.matched_quotation}\n`
-          : "";
-
-        const nasLine   = item.nas_ok   ? "📂 NAS: คัดลอกแล้ว ✓\n"
-                        : item.nas_error ? `📂 NAS: ล้มเหลว ✗ (${item.nas_error})\n`
-                        : "";
-        const printLine = item.print_ok   ? "🖨️  ปริ้น: สั่งแล้ว ✓\n"
-                        : item.print_error ? `🖨️  ปริ้น: ล้มเหลว ✗ (${item.print_error})\n`
-                        : "";
-
-        const broadcastMsg =
-          `✅ เซ็น PO เสร็จแล้ว\n` +
-          `━━━━━━━━━━━━━━━\n` +
-          `📄 PO: ${item.po_id}\n` +
-          quotationLine +
-          `📅 เวลา: ${now}\n` +
-          `👤 สั่งโดย: ${senderName}\n` +
-          `✉️  ส่งอีเมลไปที่: ${item.email}\n` +
-          `📧 อีเมล: ${item.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
-          nasLine +
-          printLine +
-          `━━━━━━━━━━━━━━━\n` +
-          `ข้อความที่ส่ง:\n${emailBody}`;
-
-        await lineBroadcast(broadcastMsg);
-
-        // ส่งรูป PO ที่เซ็นแล้ว
-        if (item.image_b64) {
-          const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-          imageStore.set(id, item.image_b64);
-          setTimeout(() => imageStore.delete(id), 10 * 60 * 1000);
-          const imageUrl = `${RENDER_URL}/po-image/${id}`;
-          await lineBroadcastImage(imageUrl);
-        }
-      }
-
-    } else {
-      await lineBroadcast("⚠️ " + (data.message || "เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ"));
-    }
-
-    // แจ้งไฟล์ที่เซ็นไม่สำเร็จ
-    if (data.failed?.length > 0) {
-      for (const item of data.failed) {
-        await lineBroadcast(
-          `❌ เซ็น PO ไม่สำเร็จ\n` +
-          `━━━━━━━━━━━━━━━\n` +
-          `📄 ไฟล์: ${item.file}\n` +
-          `⚠️ สาเหตุ: ${item.error}\n` +
-          `━━━━━━━━━━━━━━━`
-        );
-      }
-    }
+    await processPOSignResult(data, senderName);
 
   } catch (err) {
     console.error("PO Sign error:", err.message);
@@ -198,6 +232,114 @@ async function handlePOSign(event) {
     );
   }
 
+  return true;
+}
+
+// ─────────────────────────────────────────────
+//  PO Selection Handler (เลือกไฟล์ที่จะเซ็น)
+// ─────────────────────────────────────────────
+async function handlePOSelection(event) {
+  if (!pendingSignList) return false;
+
+  const text  = (event.message?.text || "").trim();
+  const lower = text.toLowerCase();
+
+  // ตรวจว่าเป็นตัวเลข หรือ "ทั้งหมด"
+  const isAll     = lower === "ทั้งหมด" || lower === "all";
+  const numTokens = text.split(/[\s,]+/).map(n => parseInt(n)).filter(n => !isNaN(n));
+  if (!isAll && numTokens.length === 0) return false;
+
+  const { files, senderName } = pendingSignList;
+  let selectedFiles;
+
+  if (isAll) {
+    selectedFiles = files;
+  } else {
+    selectedFiles = numTokens
+      .filter(n => n >= 1 && n <= files.length)
+      .map(n => files[n - 1]);
+  }
+
+  if (selectedFiles.length === 0) {
+    await lineReply(event.replyToken, "⚠️ ไม่พบหมายเลขที่เลือก กรุณาลองใหม่ครับ");
+    return true;
+  }
+
+  pendingSignList = null;
+
+  await lineReply(event.replyToken, `⏳ กำลังลงลายเซ็น ${selectedFiles.length} ไฟล์ รอสักครู่...`);
+  await lineBroadcast(`⏳ กำลังลงลายเซ็น PO ${selectedFiles.length} ไฟล์\n👤 สั่งโดย: ${senderName}\n${selectedFiles.map((f,i)=>`${i+1}. ${f}`).join("\n")}`);
+
+  try {
+    const res = await axios.post(
+      `${PO_LOCAL_URL}/sign-po`,
+      { requested_by: event.source.userId, selected_files: selectedFiles },
+      { headers: { "X-PO-Secret": PO_SECRET, "Content-Type": "application/json",
+                   "ngrok-skip-browser-warning": "true" }, timeout: 120000 }
+    );
+    // ส่งผลลัพธ์ผ่าน handlePOSign logic เดิม
+    // (จำลอง event เพื่อ reuse)
+    const data = res.data;
+    if (data.status === "busy") {
+      await lineBroadcast(`⚠️ กำลังลงลายเซ็นอยู่แล้วครับ\n👤 สั่งโดย: ${senderName}`);
+    } else {
+      // ส่งต่อให้ handlePOSign จัดการผลลัพธ์
+      await processPOSignResult(data, senderName);
+    }
+  } catch (err) {
+    await lineBroadcast(`❌ เชื่อมต่อเครื่องไม่ได้\n👤 สั่งโดย: ${senderName}\nตรวจสอบว่า Flask และ ngrok รันอยู่`);
+  }
+  return true;
+}
+
+// ─────────────────────────────────────────────
+//  Confirm / Cancel Signature Handler
+// ─────────────────────────────────────────────
+async function handleConfirmCancel(event) {
+  const text = (event.message?.text || "").trim();
+  const lower = text.toLowerCase();
+
+  const isConfirm = lower === "ยืนยัน" || lower === "confirm";
+  const isCancel  = lower === "ยกเลิก"  || lower === "cancel";
+  if (!isConfirm && !isCancel) return false;
+
+  if (pendingConfirmations.size === 0) {
+    await lineReply(event.replyToken, "ไม่มี PO ที่รอยืนยันในขณะนี้ครับ");
+    return true;
+  }
+
+  // ใช้รายการแรกที่รออยู่
+  const [po_id, pending] = pendingConfirmations.entries().next().value;
+  pendingConfirmations.delete(po_id);
+
+  const endpoint = isConfirm ? "/confirm-sign" : "/cancel-sign";
+  const headers  = { "X-PO-Secret": PO_SECRET, "Content-Type": "application/json",
+                     "ngrok-skip-browser-warning": "true" };
+
+  try {
+    const res = await axios.post(`${PO_LOCAL_URL}${endpoint}`, pending,
+      { headers, timeout: 60000 });
+
+    if (isConfirm) {
+      const d = res.data;
+      await lineBroadcast(
+        `✅ ยืนยันลายเซ็น PO แล้ว\n` +
+        `━━━━━━━━━━━━━━━\n` +
+        `📄 PO: ${po_id}\n` +
+        `📧 อีเมล: ${d.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
+        `🖨️  ปริ้น: ${d.print_ok ? "สั่งแล้ว ✓" : "ล้มเหลว ✗"}\n` +
+        `━━━━━━━━━━━━━━━`
+      );
+    } else {
+      await lineBroadcast(
+        `❌ ยกเลิกลายเซ็น PO แล้ว\n` +
+        `📄 PO: ${po_id}\n` +
+        `🔄 ไฟล์ต้นฉบับถูกคืนแล้ว — ส่ง PO ใหม่แล้วเซ็นใหม่ได้เลยครับ`
+      );
+    }
+  } catch (err) {
+    await lineBroadcast(`❌ ${isConfirm ? "ยืนยัน" : "ยกเลิก"}ไม่สำเร็จ: ${err.message}`);
+  }
   return true;
 }
 
@@ -265,6 +407,12 @@ app.post("/webhook", async (req, res) => {
 
   res.sendStatus(200);
 
+  const confirmed = await handleConfirmCancel(event);
+  if (confirmed) return;
+
+  const selected = await handlePOSelection(event);
+  if (selected) return;
+
   const handled = await handlePOSign(event);
   if (handled) return;
 
@@ -309,7 +457,7 @@ app.post("/notify-new-po", async (req, res) => {
     if (image_b64) {
       const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
       imageStore.set(id, image_b64);
-      setTimeout(() => imageStore.delete(id), 10 * 60 * 1000);
+      setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
       const imageUrl = `${RENDER_URL}/po-image/${id}`;
       await lineBroadcastImage(imageUrl);
     }
@@ -331,4 +479,12 @@ app.get("/po-image/:id", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on port " + PORT));
+app.listen(PORT, () => {
+  console.log("Server running on port " + PORT);
+
+  // Self-ping ทุก 14 นาที เพื่อไม่ให้ Render free tier นอนหลับ
+  setInterval(() => {
+    axios.get(`${RENDER_URL}/`).catch(() => {});
+    console.log("Self-ping to stay awake");
+  }, 14 * 60 * 1000);
+});
