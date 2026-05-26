@@ -116,7 +116,18 @@ async function processPOSignResult(data, senderName) {
     }
 
     const emailBody = `Dear Sir/Madam,\n\nPlease find the confirmed Purchase Order attached.\n\nPO No.: ${item.po_id}\nDate: ${item.date}\n\nBest regards,\nFES Group`;
-    const quotationLine = item.matched_quotation ? `📋 ใบเสนอราคา: ${item.matched_quotation}\n` : "";
+
+    // แสดงชื่อใบเสนอราคาที่ match พร้อม confidence / หรือแจ้งว่าไม่พบ
+    let quotationLine = "";
+    if (item.matched_quotation) {
+      const confEmoji = item.matched_confidence === "high"   ? "🟢"
+                      : item.matched_confidence === "medium" ? "🟡"
+                      : item.matched_confidence === "low"    ? "🔴" : "⚪";
+      quotationLine = `📋 ใบเสนอราคา: ${item.matched_quotation}\n   ${confEmoji} ความมั่นใจ: ${item.matched_confidence || "?"}\n`;
+    } else {
+      quotationLine = `📋 ใบเสนอราคา: ไม่พบที่ตรงกันใน NAS ⚠️\n`;
+    }
+
     const nasLine   = item.nas_ok    ? "📂 NAS: คัดลอกแล้ว ✓\n"
                     : item.nas_error ? `📂 NAS: ล้มเหลว ✗ (${item.nas_error})\n` : "";
     const printLine = item.print_ok    ? "🖨️  ปริ้น: สั่งแล้ว ✓\n"
