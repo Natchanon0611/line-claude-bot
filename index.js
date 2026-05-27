@@ -223,8 +223,7 @@ async function handlePOSign(event) {
   }
 
   // ไฟล์เดียว → เซ็นเลย
-  await lineReply(event.replyToken, "⏳ กำลังลงลายเซ็น PO อยู่ครับ รอสักครู่...");
-  await linePush(notifyId, `⏳ กำลังลงลายเซ็น PO\n👤 สั่งโดย: ${senderName}`).catch(()=>{});
+  await lineReply(event.replyToken, `⏳ กำลังลงลายเซ็น PO\n👤 สั่งโดย: ${senderName}\nรอสักครู่...`);
 
   try {
     const res = await axios.post(
@@ -495,14 +494,48 @@ async function handleSlipImage(event) {
       // ใช้ค่าว่างถ้า OCR ไม่สำเร็จ
     }
 
-    // ── 3) ส่ง notification ไปยัง LINE ──
+    // ── 3) ส่ง binary + metadata ไป Flask เพื่อบันทึก NAS ──
+    let savedFilename = null;
+    try {
+      const qs = new URLSearchParams({
+        user_id:        userId,
+        timestamp:      String(timestamp),
+        message_id:     messageId,
+        slip_date:      slipData.date      || "",
+        slip_sender:    slipData.sender    || "",
+        slip_recipient: slipData.recipient || "",
+        slip_amount:    String(slipData.amount || ""),
+        slip_ref:       slipData.ref       || "",
+      }).toString();
+
+      const saveRes = await axios.post(
+        `${PO_LOCAL_URL}/save-slip?${qs}`,
+        imgBuffer,
+        {
+          headers: {
+            "X-PO-Secret": PO_SECRET,
+            "Content-Type": "application/octet-stream",
+            "ngrok-skip-browser-warning": "true",
+          },
+          timeout: 30000,
+          maxBodyLength: 20 * 1024 * 1024,
+        }
+      );
+      savedFilename = saveRes.data?.filename || null;
+      console.log(`  ✓ บันทึกแล้ว: ${savedFilename}`);
+    } catch (saveErr) {
+      console.error("  ⚠️ save-slip failed:", saveErr.response?.data || saveErr.message);
+    }
+
+    // ── 4) ส่ง notification ไปยัง LINE ──
     const amountText = slipData.amount ? `💰 ${slipData.amount} บาท` : "💰 ยอดอ่านไม่ได้";
     const dateText   = slipData.date   ? `📅 ${slipData.date}` : "";
     const senderText = slipData.sender ? `👤 จาก: ${slipData.sender}` : "";
     const recipientText = slipData.recipient ? `🏦 ไปยัง: ${slipData.recipient}` : "";
     const refText    = slipData.ref    ? `🔖 Ref: ${slipData.ref}` : "";
+    const fileText   = savedFilename   ? `📁 ${savedFilename}` : "";
 
-    const lines = ["📥 รับสลิปโอนเงิน", amountText, dateText, senderText, recipientText, refText]
+    const lines = ["📥 รับสลิปโอนเงิน", amountText, dateText, senderText, recipientText, refText, fileText]
       .filter(Boolean).join("\n");
 
     const slipTarget = event.source.groupId || event.source.userId || lastLineSource;
@@ -515,6 +548,53 @@ async function handleSlipImage(event) {
   }
 
   return true;
+}
+
+// ─────────────────────────────────────────────
+//  Daily Slip Summary — สรุปจำนวนสลิปวันนี้ตอน 18:00
+// ─────────────────────────────────────────────
+async function sendDailySlipSummary() {
+  if (!SLIP_GROUP_ID) return;
+
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Bangkok" }); // YYYY-MM-DD
+
+  try {
+    const res = await axios.get(
+      `${PO_LOCAL_URL}/slip-stats?date=${today}`,
+      {
+        headers: { "X-PO-Secret": PO_SECRET, "ngrok-skip-browser-warning": "true" },
+        timeout: 15000,
+      }
+    );
+    const count = res.data?.count ?? 0;
+    await linePush(
+      SLIP_GROUP_ID,
+      `📊 สรุปสลิปวันนี้ (${today})\nเก็บไว้แล้ว ${count} รูป`
+    );
+    console.log(`✓ ส่งสรุปรายวัน: ${count} รูป`);
+  } catch (err) {
+    console.error("Daily summary error:", err.message);
+  }
+}
+
+// คำนวณ ms จนถึง 18:00 ของวันนี้ตามเวลา Asia/Bangkok (ถ้าผ่านแล้วใช้พรุ่งนี้)
+function msUntilNext1800Bangkok() {
+  const now    = new Date();
+  const bkkStr = now.toLocaleString("en-US", { timeZone: "Asia/Bangkok" });
+  const bkkNow = new Date(bkkStr);
+  const target = new Date(bkkNow);
+  target.setHours(18, 0, 0, 0);
+  if (target <= bkkNow) target.setDate(target.getDate() + 1);
+  return target.getTime() - bkkNow.getTime();
+}
+
+function scheduleDailySummary() {
+  const delay = msUntilNext1800Bangkok();
+  console.log(`⏰ ตั้งเวลาสรุปสลิปอีก ${Math.round(delay / 60000)} นาที`);
+  setTimeout(async () => {
+    await sendDailySlipSummary();
+    setInterval(sendDailySlipSummary, 24 * 60 * 60 * 1000); // ทุก 24 ชั่วโมง
+  }, delay);
 }
 
 // ─────────────────────────────────────────────
@@ -640,4 +720,7 @@ app.listen(PORT, () => {
     axios.get(`${RENDER_URL}/`).catch(() => {});
     console.log("Self-ping to stay awake");
   }, 14 * 60 * 1000);
+
+  // ตั้งเวลาส่งสรุปสลิปทุกวัน 18:00 (Asia/Bangkok)
+  scheduleDailySummary();
 });
