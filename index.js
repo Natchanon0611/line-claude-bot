@@ -13,19 +13,24 @@ const PO_SECRET   = process.env.PO_SECRET    || "fes-po-secret-2026";
 const RENDER_URL  = "https://line-claude-bot-y1jo.onrender.com";
 
 // ─── SLIP COLLECTOR — กลุ่ม LINE ที่จะดึงสลิปโอนเงินมาเก็บ ───
-const SLIP_GROUP_ID = process.env.SLIP_GROUP_ID || "";  // groupId ของกลุ่มสลิป
+const SLIP_GROUP_ID = process.env.SLIP_GROUP_ID || "";
 
 // เก็บ source ID ล่าสุดสำหรับ push notification
 let lastLineSource = process.env.LINE_NOTIFY_TARGET || null;
+
+// helper: คืน target สำหรับ push (lastLineSource ก่อน, fallback env, สุดท้าย null)
+function getNotifyTarget() {
+  return lastLineSource || process.env.LINE_NOTIFY_TARGET || null;
+}
 
 // เก็บรูปชั่วคราว (หมดอายุใน 1 ชั่วโมง)
 const imageStore = new Map();
 
 // เก็บ PO ที่รอยืนยันลายเซ็น
-const pendingConfirmations = new Map(); // po_id → {email, po_id, signed_file, pending_file, date}
+const pendingConfirmations = new Map();
 
 // เก็บรายการ PO ที่รอให้ user เลือก
-let pendingSignList = null; // { files: [...], senderName }
+let pendingSignList = null;
 
 // ─────────────────────────────────────────────
 //  LINE Helpers
@@ -46,7 +51,7 @@ async function linePush(to, text) {
   );
 }
 
-async function linePushImage(to, imageUrl, altText) {
+async function linePushImage(to, imageUrl) {
   await axios.post(
     "https://api.line.me/v2/bot/message/push",
     {
@@ -83,8 +88,9 @@ async function lineBroadcastImage(imageUrl) {
 async function processPOSignResult(data, senderName, notifyId) {
   const send = async (text) => {
     try { await linePush(notifyId, text); } catch (e) {
+      console.error("[SEND] linePush failed:", e.response?.status, e.message);
       try { await lineBroadcast(text); } catch (e2) {
-        console.error("send failed:", e2.message);
+        console.error("[SEND] broadcast also failed:", e2.response?.status, e2.message);
       }
     }
   };
@@ -121,7 +127,7 @@ async function processPOSignResult(data, senderName, notifyId) {
         const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
         imageStore.set(id, item.image_b64);
         setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
-        try { await linePush(notifyId, { type: "image", originalContentUrl: `${RENDER_URL}/po-image/${id}`, previewImageUrl: `${RENDER_URL}/po-image/${id}` }); }
+        try { await linePushImage(notifyId, `${RENDER_URL}/po-image/${id}`); }
         catch (e) { await lineBroadcastImage(`${RENDER_URL}/po-image/${id}`).catch(()=>{}); }
       }
       continue;
@@ -183,7 +189,8 @@ async function handlePOSign(event) {
   const groupId    = event.source.groupId || null;
   const notifyId   = groupId || userId;
 
-  // ดึงชื่อผู้สั่ง
+  console.log(`[SIGN] command="${text}" from userId=${userId} groupId=${groupId || "-"}`);
+
   let senderName = "ไม่ทราบชื่อ";
   try {
     const profile = await axios.get(
@@ -192,18 +199,20 @@ async function handlePOSign(event) {
     );
     senderName = profile.data.displayName || senderName;
   } catch (e) {
-    console.error("Get profile error:", e.message);
+    console.error("[SIGN] Get profile error:", e.message);
   }
 
-  // ── ดึงรายการ PO ก่อน ──
   let poFiles = [];
   try {
+    console.log(`[SIGN] POST ${PO_LOCAL_URL}/list-po`);
     const listRes = await axios.post(`${PO_LOCAL_URL}/list-po`, {},
       { headers: { "X-PO-Secret": PO_SECRET, "Content-Type": "application/json",
                    "ngrok-skip-browser-warning": "true" }, timeout: 15000 });
     poFiles = listRes.data.files || [];
+    console.log(`[SIGN] got ${poFiles.length} files: ${JSON.stringify(poFiles)}`);
   } catch (e) {
-    await linePush(notifyId, `❌ เชื่อมต่อเครื่องไม่ได้\n👤 สั่งโดย: ${senderName}\nตรวจสอบว่า Flask และ ngrok รันอยู่`).catch(()=>{});
+    console.error(`[SIGN] list-po FAILED: ${e.message} (code=${e.code} status=${e.response?.status})`);
+    await linePush(notifyId, `❌ เชื่อมต่อเครื่องไม่ได้\n👤 สั่งโดย: ${senderName}\nตรวจสอบว่า Flask และ ngrok รันอยู่\n[${e.message}]`).catch((err)=>console.error("[SIGN] push error notify failed:", err.message));
     return true;
   }
 
@@ -212,7 +221,6 @@ async function handlePOSign(event) {
     return true;
   }
 
-  // ถ้ามีไฟล์เดียว → เซ็นเลย / ถ้ามีหลายไฟล์ → ให้ user เลือก
   if (poFiles.length > 1) {
     pendingSignList = { files: poFiles, senderName };
     const fileList = poFiles.map((f, i) => `${i + 1}. ${f}`).join("\n");
@@ -222,10 +230,10 @@ async function handlePOSign(event) {
     return true;
   }
 
-  // ไฟล์เดียว → เซ็นเลย
   await lineReply(event.replyToken, `⏳ กำลังลงลายเซ็น PO\n👤 สั่งโดย: ${senderName}\nรอสักครู่...`);
 
   try {
+    console.log(`[SIGN] POST ${PO_LOCAL_URL}/sign-po (1 file)`);
     const res = await axios.post(
       `${PO_LOCAL_URL}/sign-po`,
       { requested_by: userId, selected_files: poFiles },
@@ -240,27 +248,29 @@ async function handlePOSign(event) {
     );
 
     const data = res.data;
+    console.log(`[SIGN] sign-po response: status=${data.status} signed=${data.signed?.length || 0} failed=${data.failed?.length || 0}`);
 
     await processPOSignResult(data, senderName, notifyId);
 
   } catch (err) {
-    console.error("PO Sign error:", err.message);
+    console.error(`[SIGN] sign-po FAILED: ${err.message} (code=${err.code} status=${err.response?.status})`);
     try {
       await linePush(notifyId,
         `❌ เชื่อมต่อเครื่องไม่ได้\n` +
         `━━━━━━━━━━━━━━━\n` +
         `👤 สั่งโดย: ${senderName}\n` +
         `⚠️ ตรวจสอบว่า Flask server และ ngrok รันอยู่\n` +
+        `[${err.message}]\n` +
         `━━━━━━━━━━━━━━━`
       );
-    } catch (e) { console.error("Broadcast error:", e.message); }
+    } catch (e) { console.error("[SIGN] error notify push failed:", e.message); }
   }
 
   return true;
 }
 
 // ─────────────────────────────────────────────
-//  PO Selection Handler (เลือกไฟล์ที่จะเซ็น)
+//  PO Selection Handler
 // ─────────────────────────────────────────────
 async function handlePOSelection(event) {
   if (!pendingSignList) return false;
@@ -268,7 +278,6 @@ async function handlePOSelection(event) {
   const text  = (event.message?.text || "").trim();
   const lower = text.toLowerCase();
 
-  // ตรวจว่าเป็นตัวเลข หรือ "ทั้งหมด"
   const isAll     = lower === "ทั้งหมด" || lower === "all";
   const numTokens = text.split(/[\s,]+/).map(n => parseInt(n)).filter(n => !isNaN(n));
   if (!isAll && numTokens.length === 0) return false;
@@ -296,15 +305,15 @@ async function handlePOSelection(event) {
   await linePush(selNotifyId2, `⏳ กำลังลงลายเซ็น PO ${selectedFiles.length} ไฟล์\n👤 สั่งโดย: ${senderName}\n${selectedFiles.map((f,i)=>`${i+1}. ${f}`).join("\n")}`).catch(()=>{});
 
   try {
+    console.log(`[SIGN-SEL] POST ${PO_LOCAL_URL}/sign-po (${selectedFiles.length} files)`);
     const res = await axios.post(
       `${PO_LOCAL_URL}/sign-po`,
       { requested_by: event.source.userId, selected_files: selectedFiles },
       { headers: { "X-PO-Secret": PO_SECRET, "Content-Type": "application/json",
                    "ngrok-skip-browser-warning": "true" }, timeout: 120000 }
     );
-    // ส่งผลลัพธ์ผ่าน handlePOSign logic เดิม
-    // (จำลอง event เพื่อ reuse)
     const data = res.data;
+    console.log(`[SIGN-SEL] response status=${data.status} signed=${data.signed?.length || 0}`);
     const selNotifyId = event.source.groupId || event.source.userId;
     if (data.status === "busy") {
       await linePush(selNotifyId, `⚠️ กำลังลงลายเซ็นอยู่แล้วครับ\n👤 สั่งโดย: ${senderName}`).catch(()=>{});
@@ -312,11 +321,11 @@ async function handlePOSelection(event) {
       await processPOSignResult(data, senderName, selNotifyId);
     }
   } catch (err) {
-    console.error("PO Selection error:", err.message);
+    console.error(`[SIGN-SEL] FAILED: ${err.message} (code=${err.code})`);
     const selNotifyId = event.source.groupId || event.source.userId;
     try {
-      await linePush(selNotifyId, `❌ เชื่อมต่อเครื่องไม่ได้\n👤 สั่งโดย: ${senderName}\nตรวจสอบว่า Flask และ ngrok รันอยู่`);
-    } catch (e) { console.error("Push error:", e.message); }
+      await linePush(selNotifyId, `❌ เชื่อมต่อเครื่องไม่ได้\n👤 สั่งโดย: ${senderName}\nตรวจสอบว่า Flask และ ngrok รันอยู่\n[${err.message}]`);
+    } catch (e) { console.error("[SIGN-SEL] push error:", e.message); }
   }
   return true;
 }
@@ -337,7 +346,6 @@ async function handleConfirmCancel(event) {
     return true;
   }
 
-  // ใช้รายการแรกที่รออยู่
   const [po_id, pending] = pendingConfirmations.entries().next().value;
   pendingConfirmations.delete(po_id);
 
@@ -417,13 +425,10 @@ async function handlePOPrint(event) {
 }
 
 // ─────────────────────────────────────────────
-//  Slip Image Handler — ดึงสลิปจากกลุ่ม LINE มาเก็บที่เครื่อง
+//  Slip Image Handler
 // ─────────────────────────────────────────────
 async function handleSlipImage(event) {
-  // ต้องเป็น message + image
   if (event.type !== "message" || event.message?.type !== "image") return false;
-
-  // ต้องมาจากกลุ่มสลิปเท่านั้น (กรองกลุ่มอื่น/แชทส่วนตัวออก)
   if (!SLIP_GROUP_ID || event.source?.groupId !== SLIP_GROUP_ID) return false;
 
   const messageId = event.message.id;
@@ -433,7 +438,6 @@ async function handleSlipImage(event) {
   console.log(`📥 รับสลิปจากกลุ่ม: ${messageId} (user: ${userId})`);
 
   try {
-    // ── 1) ดาวน์โหลด binary ของรูปจาก LINE ──
     const imgRes = await axios.get(
       `https://api-data.line.me/v2/bot/message/${messageId}/content`,
       {
@@ -447,19 +451,18 @@ async function handleSlipImage(event) {
     const imgB64    = imgBuffer.toString("base64");
     console.log(`  size: ${(imgBuffer.length / 1024).toFixed(1)} KB`);
 
-    // ── 2) OCR ผ่าน Claude Vision ──
     let slipData = { date: "", sender: "", recipient: "", amount: "", ref: "" };
     try {
       const ocrPrompt =
         'อ่านสลิปโอนเงินไทยนี้แล้วตอบเป็น JSON เท่านั้น (ไม่มี markdown, ไม่มีคำอธิบาย):\n' +
         '{\n' +
         '  "date": "YYYY-MM-DD",\n' +
-        '  "sender": "ชื่อผู้โอน/บัญชีต้นทาง (ตามที่ปรากฏในสลิป)",\n' +
-        '  "recipient": "ชื่อผู้รับ/บัญชีปลายทาง (ตามที่ปรากฏในสลิป)",\n' +
-        '  "amount": "ยอดเงิน เป็นตัวเลขเท่านั้น เช่น 1712.00",\n' +
-        '  "ref": "เลข reference / transaction id ถ้ามี ไม่มีให้ใส่ \\"\\""\n' +
+        '  "sender": "ชื่อผู้โอน/บัญชีต้นทาง",\n' +
+        '  "recipient": "ชื่อผู้รับ/บัญชีปลายทาง",\n' +
+        '  "amount": "ยอดเงิน เป็นตัวเลขเท่านั้น",\n' +
+        '  "ref": "เลข reference ถ้ามี ไม่มีให้ใส่ \\"\\""\n' +
         '}\n' +
-        'ห้ามใส่ markdown code block ห้ามใส่คำอธิบาย ตอบเฉพาะ JSON';
+        'ห้ามใส่ markdown code block ตอบเฉพาะ JSON';
 
       const claudeRes = await axios.post(
         "https://api.anthropic.com/v1/messages",
@@ -485,16 +488,13 @@ async function handleSlipImage(event) {
       );
 
       let rawText = claudeRes.data.content[0].text.trim();
-      // ตัด markdown code block ที่อาจหลุดมาแม้สั่งไม่ให้ใส่
       rawText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
       slipData = JSON.parse(rawText);
       console.log(`  OCR: ${JSON.stringify(slipData)}`);
     } catch (e) {
       console.error("  OCR failed:", e.message);
-      // ใช้ค่าว่างถ้า OCR ไม่สำเร็จ
     }
 
-    // ── 3) ส่ง binary + metadata ไป Flask เพื่อบันทึก NAS ──
     let savedFilename = null;
     try {
       const qs = new URLSearchParams({
@@ -527,7 +527,6 @@ async function handleSlipImage(event) {
       console.error("  ⚠️ save-slip failed:", saveErr.response?.data || saveErr.message);
     }
 
-    // ── 4) ส่ง notification ไปยัง LINE ──
     const amountText = slipData.amount ? `💰 ${slipData.amount} บาท` : "💰 ยอดอ่านไม่ได้";
     const dateText   = slipData.date   ? `📅 ${slipData.date}` : "";
     const senderText = slipData.sender ? `👤 จาก: ${slipData.sender}` : "";
@@ -551,33 +550,24 @@ async function handleSlipImage(event) {
 }
 
 // ─────────────────────────────────────────────
-//  Daily Slip Summary — สรุปจำนวนสลิปวันนี้ตอน 18:00
+//  Daily Slip Summary 18:00 Asia/Bangkok
 // ─────────────────────────────────────────────
 async function sendDailySlipSummary() {
   if (!SLIP_GROUP_ID) return;
-
-  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Bangkok" }); // YYYY-MM-DD
-
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Bangkok" });
   try {
     const res = await axios.get(
       `${PO_LOCAL_URL}/slip-stats?date=${today}`,
-      {
-        headers: { "X-PO-Secret": PO_SECRET, "ngrok-skip-browser-warning": "true" },
-        timeout: 15000,
-      }
+      { headers: { "X-PO-Secret": PO_SECRET, "ngrok-skip-browser-warning": "true" }, timeout: 15000 }
     );
     const count = res.data?.count ?? 0;
-    await linePush(
-      SLIP_GROUP_ID,
-      `📊 สรุปสลิปวันนี้ (${today})\nเก็บไว้แล้ว ${count} รูป`
-    );
+    await linePush(SLIP_GROUP_ID, `📊 สรุปสลิปวันนี้ (${today})\nเก็บไว้แล้ว ${count} รูป`);
     console.log(`✓ ส่งสรุปรายวัน: ${count} รูป`);
   } catch (err) {
     console.error("Daily summary error:", err.message);
   }
 }
 
-// คำนวณ ms จนถึง 18:00 ของวันนี้ตามเวลา Asia/Bangkok (ถ้าผ่านแล้วใช้พรุ่งนี้)
 function msUntilNext1800Bangkok() {
   const now    = new Date();
   const bkkStr = now.toLocaleString("en-US", { timeZone: "Asia/Bangkok" });
@@ -593,7 +583,7 @@ function scheduleDailySummary() {
   console.log(`⏰ ตั้งเวลาสรุปสลิปอีก ${Math.round(delay / 60000)} นาที`);
   setTimeout(async () => {
     await sendDailySlipSummary();
-    setInterval(sendDailySlipSummary, 24 * 60 * 60 * 1000); // ทุก 24 ชั่วโมง
+    setInterval(sendDailySlipSummary, 24 * 60 * 60 * 1000);
   }, delay);
 }
 
@@ -603,10 +593,8 @@ function scheduleDailySummary() {
 app.get("/", (req, res) => res.send("Bot is running"));
 app.get("/webhook", (req, res) => res.send("Webhook endpoint is alive"));
 
-// Deduplication — ป้องกัน LINE retry ส่ง webhook ซ้ำ
 const processedMsgIds = new Set();
 
-// LINE Webhook
 app.post("/webhook", async (req, res) => {
   const events = req.body.events || [];
   const event  = events[0];
@@ -617,7 +605,6 @@ app.post("/webhook", async (req, res) => {
     return res.sendStatus(200);
   }
 
-  // ตรวจ duplicate message ID
   const msgId = event.message.id;
   if (processedMsgIds.has(msgId)) {
     console.log(`Duplicate message ignored: ${msgId}`);
@@ -626,18 +613,15 @@ app.post("/webhook", async (req, res) => {
   processedMsgIds.add(msgId);
   setTimeout(() => processedMsgIds.delete(msgId), 5 * 60 * 1000);
 
-  // บันทึก source ID สำหรับ push notification
   lastLineSource = event.source.groupId || event.source.userId;
 
   res.sendStatus(200);
 
-  // ── จัดการรูปสลิปก่อน (image event) ──
   if (event.message.type === "image") {
     await handleSlipImage(event).catch(e => console.error("SlipImage error:", e.message));
     return;
   }
 
-  // ── ข้อความตัวอักษรเท่านั้น ──
   if (event.message.type !== "text") return;
 
   const confirmed = await handleConfirmCancel(event);
@@ -652,7 +636,6 @@ app.post("/webhook", async (req, res) => {
   const printed = await handlePOPrint(event);
   if (printed) return;
 
-  // ── ส่งให้ Claude ตอบ ──
   try {
     const claude = await axios.post(
       "https://api.anthropic.com/v1/messages",
@@ -677,7 +660,6 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// รับแจ้งเตือน PO ใหม่จาก Windows watcher
 app.post("/notify-new-po", async (req, res) => {
   const { filename, image_b64, secret } = req.body;
   if (secret !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
@@ -685,24 +667,38 @@ app.post("/notify-new-po", async (req, res) => {
   console.log(`📨 PO ใหม่: ${filename}`);
 
   try {
-    if (lastLineSource) {
-      await linePush(lastLineSource, `📨 มี PO ใหม่เข้ามาครับ\n📄 ${filename}`).catch(()=>{});
+    const target = getNotifyTarget();
+    console.log(`[NOTIFY] target=${target || "NONE"} lastLineSource=${lastLineSource || "null"} env=${process.env.LINE_NOTIFY_TARGET || "unset"}`);
+
+    if (target) {
+      try {
+        await linePush(target, `📨 มี PO ใหม่เข้ามาครับ\n📄 ${filename}`);
+        console.log(`[NOTIFY] text push OK to ${target}`);
+      } catch (e) {
+        console.error(`[NOTIFY] text push FAILED: ${e.response?.status} ${e.message}`);
+      }
       if (image_b64) {
         const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
         imageStore.set(id, image_b64);
         setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
         const imageUrl = `${RENDER_URL}/po-image/${id}`;
-        await linePushImage(lastLineSource, imageUrl).catch(()=>{});
+        try {
+          await linePushImage(target, imageUrl);
+          console.log(`[NOTIFY] image push OK`);
+        } catch (e) {
+          console.error(`[NOTIFY] image push FAILED: ${e.response?.status} ${e.message}`);
+        }
       }
+    } else {
+      console.warn("[NOTIFY] no target — set LINE_NOTIFY_TARGET env var or send any message in LINE first");
     }
-    res.json({ status: "ok" });
+    res.json({ status: "ok", target: target || null });
   } catch (err) {
     console.error("notify-new-po error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Serve รูปภาพชั่วคราว
 app.get("/po-image/:id", (req, res) => {
   const data = imageStore.get(req.params.id);
   if (!data) return res.status(404).send("Not found or expired");
@@ -715,12 +711,10 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
 
-  // Self-ping ทุก 14 นาที เพื่อไม่ให้ Render free tier นอนหลับ
   setInterval(() => {
     axios.get(`${RENDER_URL}/`).catch(() => {});
     console.log("Self-ping to stay awake");
   }, 14 * 60 * 1000);
 
-  // ตั้งเวลาส่งสรุปสลิปทุกวัน 18:00 (Asia/Bangkok)
   scheduleDailySummary();
 });
