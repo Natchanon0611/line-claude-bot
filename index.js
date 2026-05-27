@@ -416,7 +416,7 @@ async function handleSlipImage(event) {
   console.log(`📥 รับสลิปจากกลุ่ม: ${messageId} (user: ${userId})`);
 
   try {
-    // ดาวน์โหลด binary ของรูปจาก LINE
+    // ── 1) ดาวน์โหลด binary ของรูปจาก LINE ──
     const imgRes = await axios.get(
       `https://api-data.line.me/v2/bot/message/${messageId}/content`,
       {
@@ -427,17 +427,69 @@ async function handleSlipImage(event) {
     );
 
     const imgBuffer = Buffer.from(imgRes.data);
+    const imgB64    = imgBuffer.toString("base64");
     console.log(`  size: ${(imgBuffer.length / 1024).toFixed(1)} KB`);
 
-    // ส่ง binary ตรงๆ ไป Flask (เร็วและเล็กกว่า base64 25%)
-    // metadata ผ่าน query string
+    // ── 2) OCR ผ่าน Claude Vision ──
+    let slipData = { date: "", sender: "", recipient: "", amount: "", ref: "" };
+    try {
+      const ocrPrompt =
+        'อ่านสลิปโอนเงินไทยนี้แล้วตอบเป็น JSON เท่านั้น (ไม่มี markdown, ไม่มีคำอธิบาย):\n' +
+        '{\n' +
+        '  "date": "YYYY-MM-DD",\n' +
+        '  "sender": "ชื่อผู้โอน/บัญชีต้นทาง (ตามที่ปรากฏในสลิป)",\n' +
+        '  "recipient": "ชื่อผู้รับ/บัญชีปลายทาง (ตามที่ปรากฏในสลิป)",\n' +
+        '  "amount": "ยอดเงิน เป็นตัวเลขเท่านั้น เช่น 1712.00",\n' +
+        '  "ref": "เลข reference / transaction id ถ้ามี ไม่มีให้ใส่ \\"\\""\n' +
+        '}\n' +
+        'ห้ามใส่ markdown code block ห้ามใส่คำอธิบาย ตอบเฉพาะ JSON';
+
+      const claudeRes = await axios.post(
+        "https://api.anthropic.com/v1/messages",
+        {
+          model: "claude-haiku-4-5",
+          max_tokens: 500,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: "image/jpeg", data: imgB64 } },
+              { type: "text",  text: ocrPrompt }
+            ]
+          }]
+        },
+        {
+          headers: {
+            "x-api-key": process.env.CLAUDE_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+          },
+          timeout: 30000,
+        }
+      );
+
+      let rawText = claudeRes.data.content[0].text.trim();
+      // ตัด markdown code block ที่อาจหลุดมาแม้สั่งไม่ให้ใส่
+      rawText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+      slipData = JSON.parse(rawText);
+      console.log(`  OCR: ${JSON.stringify(slipData)}`);
+    } catch (ocrErr) {
+      console.error("  ⚠️ OCR error:", ocrErr.response?.data || ocrErr.message);
+      // ไม่ throw — ปล่อยให้ Flask ใช้ default
+    }
+
+    // ── 3) ส่ง binary + metadata ไป Flask ──
     const qs = new URLSearchParams({
-      user_id:    userId,
-      timestamp:  String(timestamp),
-      message_id: messageId,
+      user_id:        userId,
+      timestamp:      String(timestamp),
+      message_id:     messageId,
+      slip_date:      slipData.date      || "",
+      slip_sender:    slipData.sender    || "",
+      slip_recipient: slipData.recipient || "",
+      slip_amount:    String(slipData.amount || ""),
+      slip_ref:       slipData.ref       || "",
     }).toString();
 
-    await axios.post(
+    const saveRes = await axios.post(
       `${PO_LOCAL_URL}/save-slip?${qs}`,
       imgBuffer,
       {
@@ -451,7 +503,7 @@ async function handleSlipImage(event) {
       }
     );
 
-    console.log(`✓ บันทึกสลิปแล้ว: ${messageId}`);
+    console.log(`✓ บันทึกสลิปแล้ว: ${saveRes.data?.filename || messageId}`);
   } catch (err) {
     console.error("Slip save error:", err.response?.data || err.message);
   }
