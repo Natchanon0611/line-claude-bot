@@ -237,13 +237,15 @@ async function handlePOSign(event) {
 
   } catch (err) {
     console.error("PO Sign error:", err.message);
-    await lineBroadcast(
-      `❌ เชื่อมต่อเครื่องไม่ได้\n` +
-      `━━━━━━━━━━━━━━━\n` +
-      `👤 สั่งโดย: ${senderName}\n` +
-      `⚠️ ตรวจสอบว่า Flask server และ ngrok รันอยู่\n` +
-      `━━━━━━━━━━━━━━━`
-    );
+    try {
+      await lineBroadcast(
+        `❌ เชื่อมต่อเครื่องไม่ได้\n` +
+        `━━━━━━━━━━━━━━━\n` +
+        `👤 สั่งโดย: ${senderName}\n` +
+        `⚠️ ตรวจสอบว่า Flask server และ ngrok รันอยู่\n` +
+        `━━━━━━━━━━━━━━━`
+      );
+    } catch (e) { console.error("Broadcast error:", e.message); }
   }
 
   return true;
@@ -301,7 +303,10 @@ async function handlePOSelection(event) {
       await processPOSignResult(data, senderName);
     }
   } catch (err) {
-    await lineBroadcast(`❌ เชื่อมต่อเครื่องไม่ได้\n👤 สั่งโดย: ${senderName}\nตรวจสอบว่า Flask และ ngrok รันอยู่`);
+    console.error("PO Selection error:", err.message);
+    try {
+      await lineBroadcast(`❌ เชื่อมต่อเครื่องไม่ได้\n👤 สั่งโดย: ${senderName}\nตรวจสอบว่า Flask และ ngrok รันอยู่`);
+    } catch (e) { console.error("Broadcast error:", e.message); }
   }
   return true;
 }
@@ -472,91 +477,32 @@ async function handleSlipImage(event) {
       rawText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
       slipData = JSON.parse(rawText);
       console.log(`  OCR: ${JSON.stringify(slipData)}`);
-    } catch (ocrErr) {
-      console.error("  ⚠️ OCR error:", ocrErr.response?.data || ocrErr.message);
-      // ไม่ throw — ปล่อยให้ Flask ใช้ default
+    } catch (e) {
+      console.error("  OCR failed:", e.message);
+      // ใช้ค่าว่างถ้า OCR ไม่สำเร็จ
     }
 
-    // ── 3) ส่ง binary + metadata ไป Flask ──
-    const qs = new URLSearchParams({
-      user_id:        userId,
-      timestamp:      String(timestamp),
-      message_id:     messageId,
-      slip_date:      slipData.date      || "",
-      slip_sender:    slipData.sender    || "",
-      slip_recipient: slipData.recipient || "",
-      slip_amount:    String(slipData.amount || ""),
-      slip_ref:       slipData.ref       || "",
-    }).toString();
+    // ── 3) ส่ง notification ไปยัง LINE ──
+    const amountText = slipData.amount ? `💰 ${slipData.amount} บาท` : "💰 ยอดอ่านไม่ได้";
+    const dateText   = slipData.date   ? `📅 ${slipData.date}` : "";
+    const senderText = slipData.sender ? `👤 จาก: ${slipData.sender}` : "";
+    const recipientText = slipData.recipient ? `🏦 ไปยัง: ${slipData.recipient}` : "";
+    const refText    = slipData.ref    ? `🔖 Ref: ${slipData.ref}` : "";
 
-    const saveRes = await axios.post(
-      `${PO_LOCAL_URL}/save-slip?${qs}`,
-      imgBuffer,
-      {
-        headers: {
-          "X-PO-Secret": PO_SECRET,
-          "Content-Type": "application/octet-stream",
-          "ngrok-skip-browser-warning": "true",
-        },
-        timeout: 30000,
-        maxBodyLength: 20 * 1024 * 1024, // 20 MB
-      }
-    );
+    const lines = ["📥 รับสลิปโอนเงิน", amountText, dateText, senderText, recipientText, refText]
+      .filter(Boolean).join("\n");
 
-    console.log(`✓ บันทึกสลิปแล้ว: ${saveRes.data?.filename || messageId}`);
+    try {
+      await lineBroadcast(lines);
+    } catch (e) {
+      console.error("  Broadcast slip notification failed:", e.message);
+    }
+
   } catch (err) {
-    console.error("Slip save error:", err.response?.data || err.message);
+    console.error("handleSlipImage error:", err.message);
   }
 
-  return true; // handled — ไม่ต้องส่งต่อให้ handler อื่น
-}
-
-// ─────────────────────────────────────────────
-//  Daily Slip Summary — สรุปจำนวนสลิปวันนี้ตอน 18:00
-// ─────────────────────────────────────────────
-async function sendDailySlipSummary() {
-  if (!SLIP_GROUP_ID) return;
-
-  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Bangkok" }); // YYYY-MM-DD
-
-  try {
-    const res = await axios.get(
-      `${PO_LOCAL_URL}/slip-stats?date=${today}`,
-      {
-        headers: { "X-PO-Secret": PO_SECRET, "ngrok-skip-browser-warning": "true" },
-        timeout: 15000,
-      }
-    );
-    const count = res.data?.count ?? 0;
-    await linePush(
-      SLIP_GROUP_ID,
-      `📊 สรุปสลิปวันนี้ (${today})\nเก็บไว้แล้ว ${count} รูป`
-    );
-    console.log(`✓ ส่งสรุปรายวัน: ${count} รูป`);
-  } catch (err) {
-    console.error("Daily summary error:", err.message);
-  }
-}
-
-// คำนวณ ms จนถึง 18:00 ของวันนี้ตามเวลา Asia/Bangkok (ถ้าผ่านแล้วใช้พรุ่งนี้)
-function msUntilNext1800Bangkok() {
-  const now    = new Date();
-  // เวลา Bangkok ตอนนี้ (เป็น string)
-  const bkkStr = now.toLocaleString("en-US", { timeZone: "Asia/Bangkok" });
-  const bkkNow = new Date(bkkStr);
-  const target = new Date(bkkNow);
-  target.setHours(18, 0, 0, 0);
-  if (target <= bkkNow) target.setDate(target.getDate() + 1);
-  return target.getTime() - bkkNow.getTime();
-}
-
-function scheduleDailySummary() {
-  const delay = msUntilNext1800Bangkok();
-  console.log(`⏰ ตั้งเวลาสรุปสลิปอีก ${Math.round(delay / 60000)} นาที`);
-  setTimeout(async () => {
-    await sendDailySlipSummary();
-    setInterval(sendDailySlipSummary, 24 * 60 * 60 * 1000); // ทุก 24 ชั่วโมง
-  }, delay);
+  return true;
 }
 
 // ─────────────────────────────────────────────
@@ -575,7 +521,6 @@ app.post("/webhook", async (req, res) => {
 
   console.log("EVENT =", JSON.stringify(req.body));
 
-  // รับเฉพาะ message event (image หรือ text)
   if (!event || event.type !== "message") {
     return res.sendStatus(200);
   }
@@ -587,23 +532,21 @@ app.post("/webhook", async (req, res) => {
     return res.sendStatus(200);
   }
   processedMsgIds.add(msgId);
-  setTimeout(() => processedMsgIds.delete(msgId), 5 * 60 * 1000); // ลบหลัง 5 นาที
+  setTimeout(() => processedMsgIds.delete(msgId), 5 * 60 * 1000);
 
   // บันทึก source ID สำหรับ push notification
   lastLineSource = event.source.groupId || event.source.userId;
 
   res.sendStatus(200);
 
-  // ── ถ้าเป็นรูป → ลอง handler สลิปก่อน (กรองตาม groupId ในฟังก์ชัน) ──
+  // ── จัดการรูปสลิปก่อน (image event) ──
   if (event.message.type === "image") {
-    await handleSlipImage(event);
-    return; // image event ไม่ต้องไปต่อ handler text อื่นๆ
-  }
-
-  // ── ถ้าไม่ใช่ text ก็จบเลย (sticker, video, audio, location, ฯลฯ) ──
-  if (event.message.type !== "text") {
+    await handleSlipImage(event).catch(e => console.error("SlipImage error:", e.message));
     return;
   }
+
+  // ── ข้อความตัวอักษรเท่านั้น ──
+  if (event.message.type !== "text") return;
 
   const confirmed = await handleConfirmCancel(event);
   if (confirmed) return;
@@ -685,7 +628,4 @@ app.listen(PORT, () => {
     axios.get(`${RENDER_URL}/`).catch(() => {});
     console.log("Self-ping to stay awake");
   }, 14 * 60 * 1000);
-
-  // ตั้งเวลาส่งสรุปสลิปทุกวัน 18:00 (Asia/Bangkok)
-  scheduleDailySummary();
 });
