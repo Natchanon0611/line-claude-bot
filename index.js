@@ -426,19 +426,28 @@ async function handleSlipImage(event) {
       }
     );
 
-    const image_b64 = Buffer.from(imgRes.data).toString("base64");
+    const imgBuffer = Buffer.from(imgRes.data);
+    console.log(`  size: ${(imgBuffer.length / 1024).toFixed(1)} KB`);
 
-    // ส่งไปเซฟที่ Local Flask Server
+    // ส่ง binary ตรงๆ ไป Flask (เร็วและเล็กกว่า base64 25%)
+    // metadata ผ่าน query string
+    const qs = new URLSearchParams({
+      user_id:    userId,
+      timestamp:  String(timestamp),
+      message_id: messageId,
+    }).toString();
+
     await axios.post(
-      `${PO_LOCAL_URL}/save-slip`,
-      { image_b64, user_id: userId, timestamp, message_id: messageId },
+      `${PO_LOCAL_URL}/save-slip?${qs}`,
+      imgBuffer,
       {
         headers: {
           "X-PO-Secret": PO_SECRET,
-          "Content-Type": "application/json",
+          "Content-Type": "application/octet-stream",
           "ngrok-skip-browser-warning": "true",
         },
         timeout: 30000,
+        maxBodyLength: 20 * 1024 * 1024, // 20 MB
       }
     );
 
