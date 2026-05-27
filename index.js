@@ -203,7 +203,7 @@ async function handlePOSign(event) {
                    "ngrok-skip-browser-warning": "true" }, timeout: 15000 });
     poFiles = listRes.data.files || [];
   } catch (e) {
-    await lineBroadcast(`❌ เชื่อมต่อเครื่องไม่ได้\n👤 สั่งโดย: ${senderName}\nตรวจสอบว่า Flask และ ngrok รันอยู่`);
+    await linePush(notifyId, `❌ เชื่อมต่อเครื่องไม่ได้\n👤 สั่งโดย: ${senderName}\nตรวจสอบว่า Flask และ ngrok รันอยู่`).catch(()=>{});
     return true;
   }
 
@@ -224,7 +224,7 @@ async function handlePOSign(event) {
 
   // ไฟล์เดียว → เซ็นเลย
   await lineReply(event.replyToken, "⏳ กำลังลงลายเซ็น PO อยู่ครับ รอสักครู่...");
-  await lineBroadcast(`⏳ กำลังลงลายเซ็น PO\n👤 สั่งโดย: ${senderName}`);
+  await linePush(notifyId, `⏳ กำลังลงลายเซ็น PO\n👤 สั่งโดย: ${senderName}`).catch(()=>{});
 
   try {
     const res = await axios.post(
@@ -292,8 +292,9 @@ async function handlePOSelection(event) {
 
   pendingSignList = null;
 
+  const selNotifyId2 = event.source.groupId || event.source.userId;
   await lineReply(event.replyToken, `⏳ กำลังลงลายเซ็น ${selectedFiles.length} ไฟล์ รอสักครู่...`);
-  await lineBroadcast(`⏳ กำลังลงลายเซ็น PO ${selectedFiles.length} ไฟล์\n👤 สั่งโดย: ${senderName}\n${selectedFiles.map((f,i)=>`${i+1}. ${f}`).join("\n")}`);
+  await linePush(selNotifyId2, `⏳ กำลังลงลายเซ็น PO ${selectedFiles.length} ไฟล์\n👤 สั่งโดย: ${senderName}\n${selectedFiles.map((f,i)=>`${i+1}. ${f}`).join("\n")}`).catch(()=>{});
 
   try {
     const res = await axios.post(
@@ -349,25 +350,27 @@ async function handleConfirmCancel(event) {
     const res = await axios.post(`${PO_LOCAL_URL}${endpoint}`, pending,
       { headers, timeout: 60000 });
 
+    const ccNotifyId = event.source.groupId || event.source.userId;
     if (isConfirm) {
       const d = res.data;
-      await lineBroadcast(
+      await linePush(ccNotifyId,
         `✅ ยืนยันลายเซ็น PO แล้ว\n` +
         `━━━━━━━━━━━━━━━\n` +
         `📄 PO: ${po_id}\n` +
         `📧 อีเมล: ${d.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
         `🖨️  ปริ้น: ${d.print_ok ? "สั่งแล้ว ✓" : "ล้มเหลว ✗"}\n` +
         `━━━━━━━━━━━━━━━`
-      );
+      ).catch(()=>{});
     } else {
-      await lineBroadcast(
+      await linePush(ccNotifyId,
         `❌ ยกเลิกลายเซ็น PO แล้ว\n` +
         `📄 PO: ${po_id}\n` +
         `🔄 ไฟล์ต้นฉบับถูกคืนแล้ว — ส่ง PO ใหม่แล้วเซ็นใหม่ได้เลยครับ`
-      );
+      ).catch(()=>{});
     }
   } catch (err) {
-    await lineBroadcast(`❌ ${isConfirm ? "ยืนยัน" : "ยกเลิก"}ไม่สำเร็จ: ${err.message}`);
+    const ccNotifyId = event.source.groupId || event.source.userId;
+    await linePush(ccNotifyId, `❌ ${isConfirm ? "ยืนยัน" : "ยกเลิก"}ไม่สำเร็จ: ${err.message}`).catch(()=>{});
   }
   return true;
 }
@@ -502,10 +505,9 @@ async function handleSlipImage(event) {
     const lines = ["📥 รับสลิปโอนเงิน", amountText, dateText, senderText, recipientText, refText]
       .filter(Boolean).join("\n");
 
-    try {
-      await lineBroadcast(lines);
-    } catch (e) {
-      console.error("  Broadcast slip notification failed:", e.message);
+    const slipTarget = event.source.groupId || event.source.userId || lastLineSource;
+    if (slipTarget) {
+      await linePush(slipTarget, lines).catch(e => console.error("  Slip push failed:", e.message));
     }
 
   } catch (err) {
@@ -603,16 +605,16 @@ app.post("/notify-new-po", async (req, res) => {
   console.log(`📨 PO ใหม่: ${filename}`);
 
   try {
-    await lineBroadcast(`📨 มี PO ใหม่เข้ามาครับ\n📄 ${filename}`);
-
-    if (image_b64) {
-      const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      imageStore.set(id, image_b64);
-      setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
-      const imageUrl = `${RENDER_URL}/po-image/${id}`;
-      await lineBroadcastImage(imageUrl);
+    if (lastLineSource) {
+      await linePush(lastLineSource, `📨 มี PO ใหม่เข้ามาครับ\n📄 ${filename}`).catch(()=>{});
+      if (image_b64) {
+        const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        imageStore.set(id, image_b64);
+        setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
+        const imageUrl = `${RENDER_URL}/po-image/${id}`;
+        await linePushImage(lastLineSource, imageUrl).catch(()=>{});
+      }
     }
-
     res.json({ status: "ok" });
   } catch (err) {
     console.error("notify-new-po error:", err.message);
