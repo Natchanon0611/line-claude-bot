@@ -497,34 +497,18 @@ async function handleSlipImage(event) {
 
     let savedFilename = null;
     try {
-      const qs = new URLSearchParams({
-        user_id:        userId,
-        timestamp:      String(timestamp),
-        message_id:     messageId,
-        slip_date:      slipData.date      || "",
-        slip_sender:    slipData.sender    || "",
-        slip_recipient: slipData.recipient || "",
-        slip_amount:    String(slipData.amount || ""),
-        slip_ref:       slipData.ref       || "",
-      }).toString();
-
-      const saveRes = await axios.post(
-        `${PO_LOCAL_URL}/save-slip?${qs}`,
-        imgBuffer,
-        {
-          headers: {
-            "X-PO-Secret": PO_SECRET,
-            "Content-Type": "application/octet-stream",
-            "ngrok-skip-browser-warning": "true",
-          },
-          timeout: 30000,
-          maxBodyLength: 20 * 1024 * 1024,
-        }
-      );
-      savedFilename = saveRes.data?.filename || null;
+      savedFilename = await uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId, slipData });
       console.log(`  ✓ บันทึกแล้ว: ${savedFilename}`);
     } catch (saveErr) {
       console.error("  ⚠️ save-slip failed:", saveErr.response?.data || saveErr.message);
+      // เก็บเข้าคิว retry — เก็บแค่ messageId + slipData (ไม่เก็บ imgBuffer เพื่อประหยัด memory)
+      // ตอน retry จะดาวน์โหลดรูปจาก LINE ใหม่ (รูปอยู่บน LINE 14 วัน)
+      pendingSlips.set(messageId, {
+        userId, timestamp, slipData,
+        addedAt: Date.now(),
+        retries: 0,
+      });
+      console.log(`  📋 เพิ่มเข้าคิว retry (รวม ${pendingSlips.size} รายการ)`);
     }
 
     const amountText = slipData.amount ? `💰 ${slipData.amount} บาท` : "💰 ยอดอ่านไม่ได้";
@@ -547,6 +531,98 @@ async function handleSlipImage(event) {
   }
 
   return true;
+}
+
+// ─────────────────────────────────────────────
+//  Slip Upload Helper + Auto-Retry Queue
+// ─────────────────────────────────────────────
+
+// คิวสำหรับสลิปที่ save ไม่สำเร็จ (เช่น Flask down / ngrok down)
+// key = messageId, value = {userId, timestamp, slipData, addedAt, retries}
+const pendingSlips = new Map();
+
+const RETRY_INTERVAL_MS  = 5 * 60 * 1000;  // retry ทุก 5 นาที
+const RETRY_MAX_AGE_HOURS = 12;             // ลบจากคิวถ้าค้างเกิน 12 ชั่วโมง (กัน leak)
+
+/**
+ * อัพโหลดสลิปไป Flask
+ * ถ้า imgBuffer ไม่มี (กรณี retry) จะดาวน์โหลดจาก LINE Content API ใหม่
+ */
+async function uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId, slipData }) {
+  // ถ้าไม่มี buffer → ดาวน์โหลดจาก LINE ใหม่ (กรณี retry)
+  if (!imgBuffer) {
+    const imgRes = await axios.get(
+      `https://api-data.line.me/v2/bot/message/${messageId}/content`,
+      {
+        headers: { Authorization: `Bearer ${LINE_TOKEN}` },
+        responseType: "arraybuffer",
+        timeout: 30000,
+      }
+    );
+    imgBuffer = Buffer.from(imgRes.data);
+  }
+
+  const qs = new URLSearchParams({
+    user_id:        userId || "RECOVERY",
+    timestamp:      String(timestamp || Date.now()),
+    message_id:     messageId,
+    slip_date:      slipData?.date      || "",
+    slip_sender:    slipData?.sender    || "",
+    slip_recipient: slipData?.recipient || "",
+    slip_amount:    String(slipData?.amount || ""),
+    slip_ref:       slipData?.ref       || "",
+  }).toString();
+
+  const saveRes = await axios.post(
+    `${PO_LOCAL_URL}/save-slip?${qs}`,
+    imgBuffer,
+    {
+      headers: {
+        "X-PO-Secret": PO_SECRET,
+        "Content-Type": "application/octet-stream",
+        "ngrok-skip-browser-warning": "true",
+      },
+      timeout: 30000,
+      maxBodyLength: 20 * 1024 * 1024,
+    }
+  );
+
+  return saveRes.data?.filename || null;
+}
+
+/**
+ * ลองส่งสลิปในคิวอีกครั้ง — รันทุก 5 นาที
+ */
+async function retryPendingSlips() {
+  if (pendingSlips.size === 0) return;
+
+  console.log(`🔄 retry pending slips: ${pendingSlips.size} รายการ`);
+
+  const cutoff = Date.now() - RETRY_MAX_AGE_HOURS * 60 * 60 * 1000;
+
+  for (const [messageId, info] of pendingSlips.entries()) {
+    // ลบรายการที่ค้างนานเกินไป (รูปบน LINE หมดอายุ 14 วัน แต่เกินบางขนาดก็เลิกลอง)
+    if (info.addedAt < cutoff) {
+      console.log(`  ⏰ ลบจากคิว (เก่าเกิน ${RETRY_MAX_AGE_HOURS}h): ${messageId}`);
+      pendingSlips.delete(messageId);
+      continue;
+    }
+
+    try {
+      const filename = await uploadSlipToFlask({
+        imgBuffer: null,  // จะดาวน์โหลดใหม่
+        userId:    info.userId,
+        timestamp: info.timestamp,
+        messageId,
+        slipData:  info.slipData,
+      });
+      console.log(`  ✓ retry สำเร็จ: ${filename} (${messageId})`);
+      pendingSlips.delete(messageId);
+    } catch (err) {
+      info.retries++;
+      console.log(`  ✗ retry ครั้งที่ ${info.retries} ล้มเหลว: ${messageId} — ${err.message}`);
+    }
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -707,6 +783,75 @@ app.get("/po-image/:id", (req, res) => {
   res.send(buf);
 });
 
+// ดูสลิปที่ค้างในคิว retry
+app.get("/pending-slips", (req, res) => {
+  if (req.query.secret !== PO_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const list = [];
+  for (const [messageId, info] of pendingSlips.entries()) {
+    list.push({
+      messageId,
+      retries:   info.retries,
+      addedAt:   new Date(info.addedAt).toISOString(),
+      ageMinutes: Math.round((Date.now() - info.addedAt) / 60000),
+    });
+  }
+  res.json({ count: list.length, list });
+});
+
+// บังคับ retry ทันที (ไม่ต้องรอ 5 นาที)
+app.get("/retry-pending-slips", async (req, res) => {
+  if (req.query.secret !== PO_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  const before = pendingSlips.size;
+  await retryPendingSlips();
+  const after = pendingSlips.size;
+  res.json({ status: "ok", before, after, recovered: before - after });
+});
+
+// ─────────────────────────────────────────────
+//  Slip Recovery — โหลดสลิปย้อนหลังด้วย messageId
+//  ใช้กรณีที่ตอนสลิปมา ngrok ตาย/Flask ปิด
+//  GET /recover-slip?messageId=XXX&secret=XXX[&messageId=...]
+// ─────────────────────────────────────────────
+app.get("/recover-slip", async (req, res) => {
+  if (req.query.secret !== PO_SECRET) {
+    return res.status(401).json({ error: "Unauthorized — ใส่ ?secret=... ใน URL" });
+  }
+
+  // รับได้ทั้ง 1 ตัว หรือหลายตัว (?messageId=1&messageId=2)
+  let ids = req.query.messageId;
+  if (!ids) return res.status(400).json({ error: "messageId required" });
+  if (!Array.isArray(ids)) ids = [ids];
+
+  const results = [];
+
+  for (const messageId of ids) {
+    // จำลอง event เหมือนของจริง แล้วเรียก handleSlipImage
+    const fakeEvent = {
+      type: "message",
+      message: { type: "image", id: messageId },
+      source: {
+        type:    "group",
+        groupId: SLIP_GROUP_ID,
+        userId:  "RECOVERY",
+      },
+      timestamp: Date.now(),
+    };
+
+    try {
+      const handled = await handleSlipImage(fakeEvent);
+      results.push({ messageId, status: handled ? "ok" : "skipped" });
+    } catch (err) {
+      results.push({ messageId, status: "error", error: err.message });
+    }
+  }
+
+  res.json({ status: "ok", count: results.length, results });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
@@ -717,4 +862,8 @@ app.listen(PORT, () => {
   }, 14 * 60 * 1000);
 
   scheduleDailySummary();
+
+  // Auto-retry slip ที่ค้างในคิว ทุก 5 นาที
+  setInterval(retryPendingSlips, RETRY_INTERVAL_MS);
+  console.log(`🔁 ตั้ง auto-retry pending slips ทุก ${RETRY_INTERVAL_MS / 60000} นาที`);
 });
