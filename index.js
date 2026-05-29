@@ -861,4 +861,22 @@ app.get("/retry-pending-slips", async (req, res) => {
   res.json({ status: "ok", before, after, recovered: before - after });
 });
 
-// ─────────────────────────�
+// ─────────────────────────────────────────────
+//  Start server
+// ─────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("Server running on port " + PORT);
+
+  // Self-ping ทุก 14 นาที เพื่อไม่ให้ Render free tier นอนหลับ
+  setInterval(() => {
+    axios.get(`${RENDER_URL}/`).catch(() => {});
+    console.log("Self-ping to stay awake");
+  }, 14 * 60 * 1000);
+
+  scheduleDailySummary();
+
+  // Auto-retry slip ที่ค้างในคิว ทุก 5 นาที
+  setInterval(retryPendingSlips, RETRY_INTERVAL_MS);
+  console.log(`🔁 ตั้ง auto-retry pending slips ทุก ${RETRY_INTERVAL_MS / 60000} นาที`);
+});
