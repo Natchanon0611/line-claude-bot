@@ -133,8 +133,6 @@ async function processPOSignResult(data, senderName, notifyId) {
       continue;
     }
 
-    const emailBody = `Dear Sir/Madam,\n\nPlease find the confirmed Purchase Order attached.\n\nPO No.: ${item.po_id}\nDate: ${item.date}\n\nBest regards,\nFES Group`;
-
     let quotationLine = "";
     if (item.matched_quotation) {
       const confEmoji = item.matched_confidence === "high"   ? "🟢"
@@ -145,18 +143,18 @@ async function processPOSignResult(data, senderName, notifyId) {
       quotationLine = `📋 ใบเสนอราคา: ไม่พบที่ตรงกันใน NAS ⚠️\n`;
     }
 
-    const nasLine   = item.nas_ok    ? "📂 NAS: คัดลอกแล้ว ✓\n"
-                    : item.nas_error ? `📂 NAS: ล้มเหลว ✗ (${item.nas_error})\n` : "";
+    const nasLine   = item.nas_ok
+                        ? `📂 NAS: คัดลอกแล้ว ✓\n${item.nas_path ? `   ${item.nas_path}\n` : ""}`
+                        : item.nas_error ? `📂 NAS: ล้มเหลว ✗ (${item.nas_error})\n` : "";
     const printLine = item.print_ok    ? "🖨️  ปริ้น: สั่งแล้ว ✓\n"
                     : item.print_error ? `🖨️  ปริ้น: ล้มเหลว ✗ (${item.print_error})\n` : "";
+    const fileLine  = item.output_file ? `📄 ไฟล์: ${item.output_file}\n` : "";
 
     await send(
       `✅ เซ็น PO เสร็จแล้ว\n━━━━━━━━━━━━━━━\n` +
-      `📄 PO: ${item.po_id}\n` + quotationLine +
+      `📄 PO: ${item.po_id}\n` + quotationLine + fileLine +
       `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
-      `✉️  ส่งอีเมลไปที่: ${item.email}\n` +
-      `📧 อีเมล: ${item.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
-      nasLine + printLine + `━━━━━━━━━━━━━━━\nข้อความที่ส่ง:\n${emailBody}`
+      nasLine + printLine + `━━━━━━━━━━━━━━━`
     );
 
     if (item.image_b64) {
