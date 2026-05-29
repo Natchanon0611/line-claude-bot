@@ -773,6 +773,58 @@ app.post("/notify-new-po", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────
+//  [NEW WORKFLOW] Auto-sign endpoint
+//  รับ trigger จาก po_watcher → call Flask /sign-po → push LINE ผลลัพธ์
+// ─────────────────────────────────────────────
+app.post("/auto-sign-po", async (req, res) => {
+  const { filename, secret } = req.body;
+  if (secret !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
+
+  console.log(`[AUTO-SIGN] received: ${filename}`);
+  // ตอบ po_watcher กลับเลย — sign ใช้เวลานาน, ทำ async
+  res.json({ status: "accepted", filename });
+
+  const target     = getNotifyTarget();
+  const senderName = "ระบบ Auto-Sign";
+
+  if (!target) {
+    console.warn("[AUTO-SIGN] no LINE target — set LINE_NOTIFY_TARGET env");
+  }
+
+  try {
+    console.log(`[AUTO-SIGN] POST ${PO_LOCAL_URL}/sign-po (1 file)`);
+    const signRes = await axios.post(
+      `${PO_LOCAL_URL}/sign-po`,
+      { requested_by: "auto-watcher", selected_files: [filename] },
+      {
+        headers: {
+          "X-PO-Secret": PO_SECRET,
+          "Content-Type": "application/json",
+          "ngrok-skip-browser-warning": "true"
+        },
+        timeout: 180000
+      }
+    );
+
+    const data = signRes.data;
+    console.log(`[AUTO-SIGN] response: status=${data.status} signed=${data.signed?.length || 0} failed=${data.failed?.length || 0}`);
+
+    if (target) {
+      await processPOSignResult(data, senderName, target);
+    }
+  } catch (err) {
+    console.error(`[AUTO-SIGN] FAILED: ${err.message} (code=${err.code} status=${err.response?.status})`);
+    if (target) {
+      try {
+        await linePush(target,
+          `❌ Auto-sign ล้มเหลว\n━━━━━━━━━━━━━━━\n📄 ไฟล์: ${filename}\n⚠️ ${err.message}\n━━━━━━━━━━━━━━━`
+        );
+      } catch (e) { console.error("[AUTO-SIGN] error push failed:", e.message); }
+    }
+  }
+});
+
 app.get("/po-image/:id", (req, res) => {
   const data = imageStore.get(req.params.id);
   if (!data) return res.status(404).send("Not found or expired");
@@ -809,59 +861,4 @@ app.get("/retry-pending-slips", async (req, res) => {
   res.json({ status: "ok", before, after, recovered: before - after });
 });
 
-// ─────────────────────────────────────────────
-//  Slip Recovery — โหลดสลิปย้อนหลังด้วย messageId
-//  ใช้กรณีที่ตอนสลิปมา ngrok ตาย/Flask ปิด
-//  GET /recover-slip?messageId=XXX&secret=XXX[&messageId=...]
-// ─────────────────────────────────────────────
-app.get("/recover-slip", async (req, res) => {
-  if (req.query.secret !== PO_SECRET) {
-    return res.status(401).json({ error: "Unauthorized — ใส่ ?secret=... ใน URL" });
-  }
-
-  // รับได้ทั้ง 1 ตัว หรือหลายตัว (?messageId=1&messageId=2)
-  let ids = req.query.messageId;
-  if (!ids) return res.status(400).json({ error: "messageId required" });
-  if (!Array.isArray(ids)) ids = [ids];
-
-  const results = [];
-
-  for (const messageId of ids) {
-    // จำลอง event เหมือนของจริง แล้วเรียก handleSlipImage
-    const fakeEvent = {
-      type: "message",
-      message: { type: "image", id: messageId },
-      source: {
-        type:    "group",
-        groupId: SLIP_GROUP_ID,
-        userId:  "RECOVERY",
-      },
-      timestamp: Date.now(),
-    };
-
-    try {
-      const handled = await handleSlipImage(fakeEvent);
-      results.push({ messageId, status: handled ? "ok" : "skipped" });
-    } catch (err) {
-      results.push({ messageId, status: "error", error: err.message });
-    }
-  }
-
-  res.json({ status: "ok", count: results.length, results });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server running on port " + PORT);
-
-  setInterval(() => {
-    axios.get(`${RENDER_URL}/`).catch(() => {});
-    console.log("Self-ping to stay awake");
-  }, 14 * 60 * 1000);
-
-  scheduleDailySummary();
-
-  // Auto-retry slip ที่ค้างในคิว ทุก 5 นาที
-  setInterval(retryPendingSlips, RETRY_INTERVAL_MS);
-  console.log(`🔁 ตั้ง auto-retry pending slips ทุก ${RETRY_INTERVAL_MS / 60000} นาที`);
-});
+// ─────────────────────────�
