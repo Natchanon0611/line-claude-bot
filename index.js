@@ -712,6 +712,9 @@ app.post("/webhook", async (req, res) => {
 
   if (event.message.type !== "text") return;
 
+  // กลุ่มรับสลิป: บอทไม่ตอบข้อความผู้ใช้ — เก็บสลิป + สรุปรายวันอย่างเดียว
+  if (SLIP_GROUP_ID && event.source?.groupId === SLIP_GROUP_ID) return;
+
   const confirmed = await handleConfirmCancel(event);
   if (confirmed) return;
 
