@@ -802,12 +802,25 @@ app.post("/auto-sign-po", async (req, res) => {
   // ตอบ po_watcher กลับเลย — sign ใช้เวลานาน, ทำ async
   res.json({ status: "accepted", filename });
 
-  const target     = getNotifyTarget();
   const senderName = "ระบบ Auto-Sign";
 
-  if (!target) {
-    console.warn("[AUTO-SIGN] no LINE target — set LINE_NOTIFY_TARGET env");
-  }
+  // [BROADCAST MODE] ส่งให้ทุก friend ของบอท (1:1 chat) — ไม่ส่งเข้า group
+  const bsend = async (text) => {
+    try {
+      await lineBroadcast(text);
+      console.log(`[AUTO-SIGN] broadcast OK (${String(text).substring(0,30)}...)`);
+    } catch (e) {
+      console.error(`[AUTO-SIGN] broadcast FAILED: ${e.response?.status} ${e.message}`);
+    }
+  };
+  const bsendImage = async (imageUrl) => {
+    try {
+      await lineBroadcastImage(imageUrl);
+      console.log(`[AUTO-SIGN] broadcast image OK`);
+    } catch (e) {
+      console.error(`[AUTO-SIGN] broadcast image FAILED: ${e.response?.status} ${e.message}`);
+    }
+  };
 
   try {
     console.log(`[AUTO-SIGN] POST ${PO_LOCAL_URL}/sign-po (1 file)`);
@@ -827,18 +840,64 @@ app.post("/auto-sign-po", async (req, res) => {
     const data = signRes.data;
     console.log(`[AUTO-SIGN] response: status=${data.status} signed=${data.signed?.length || 0} failed=${data.failed?.length || 0}`);
 
-    if (target) {
-      await processPOSignResult(data, senderName, target);
+    if (data.status === "busy") {
+      await bsend(`⚠️ กำลังลงลายเซ็นอยู่แล้วครับ\n👤 สั่งโดย: ${senderName}`);
+      return;
+    }
+    if (data.status === "no_files") {
+      await bsend(`✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ`);
+      return;
+    }
+
+    const now = new Date().toLocaleString("th-TH", {
+      timeZone: "Asia/Bangkok", year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit"
+    });
+
+    for (const item of (data.signed || [])) {
+      let quotationLine = "";
+      if (item.matched_quotation) {
+        const confEmoji = item.matched_confidence === "high"   ? "🟢"
+                        : item.matched_confidence === "medium" ? "🟡"
+                        : item.matched_confidence === "low"    ? "🔴" : "⚪";
+        quotationLine = `📋 ใบเสนอราคา: ${item.matched_quotation}\n   ${confEmoji} ความมั่นใจ: ${item.matched_confidence || "?"}\n`;
+      } else {
+        quotationLine = `📋 ใบเสนอราคา: ไม่พบที่ตรงกันใน NAS ⚠️\n`;
+      }
+
+      const nasLine   = item.nas_ok
+                          ? `📂 NAS: คัดลอกแล้ว ✓\n${item.nas_path ? `   ${item.nas_path}\n` : ""}`
+                          : item.nas_error ? `📂 NAS: ล้มเหลว ✗ (${item.nas_error})\n` : "";
+      const printLine = item.print_ok    ? "🖨️  ปริ้น: สั่งแล้ว ✓\n"
+                      : item.print_error ? `🖨️  ปริ้น: ล้มเหลว ✗ (${item.print_error})\n` : "";
+      const fileLine  = item.output_file ? `📄 ไฟล์: ${item.output_file}\n` : "";
+
+      await bsend(
+        `✅ เซ็น PO เสร็จแล้ว\n━━━━━━━━━━━━━━━\n` +
+        `📄 PO: ${item.po_id}\n` + quotationLine + fileLine +
+        `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
+        nasLine + printLine + `━━━━━━━━━━━━━━━`
+      );
+
+      if (item.image_b64) {
+        const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        imageStore.set(id, item.image_b64);
+        setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
+        await bsendImage(`${RENDER_URL}/po-image/${id}`);
+      }
+    }
+
+    for (const item of (data.failed || [])) {
+      await bsend(
+        `❌ เซ็น PO ไม่สำเร็จ\n━━━━━━━━━━━━━━━\n` +
+        `📄 ไฟล์: ${item.file}\n⚠️ สาเหตุ: ${item.error}\n━━━━━━━━━━━━━━━`
+      );
     }
   } catch (err) {
     console.error(`[AUTO-SIGN] FAILED: ${err.message} (code=${err.code} status=${err.response?.status})`);
-    if (target) {
-      try {
-        await linePush(target,
-          `❌ Auto-sign ล้มเหลว\n━━━━━━━━━━━━━━━\n📄 ไฟล์: ${filename}\n⚠️ ${err.message}\n━━━━━━━━━━━━━━━`
-        );
-      } catch (e) { console.error("[AUTO-SIGN] error push failed:", e.message); }
-    }
+    await bsend(
+      `❌ Auto-sign ล้มเหลว\n━━━━━━━━━━━━━━━\n📄 ไฟล์: ${filename}\n⚠️ ${err.message}\n━━━━━━━━━━━━━━━`
+    );
   }
 });
 
@@ -850,34 +909,6 @@ app.get("/po-image/:id", (req, res) => {
   res.send(buf);
 });
 
-// ดูสลิปที่ค้างในคิว retry
-app.get("/pending-slips", (req, res) => {
-  if (req.query.secret !== PO_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  const list = [];
-  for (const [messageId, info] of pendingSlips.entries()) {
-    list.push({
-      messageId,
-      retries:   info.retries,
-      addedAt:   new Date(info.addedAt).toISOString(),
-      ageMinutes: Math.round((Date.now() - info.addedAt) / 60000),
-    });
-  }
-  res.json({ count: list.length, list });
-});
-
-// บังคับ retry ทันที (ไม่ต้องรอ 5 นาที)
-app.get("/retry-pending-slips", async (req, res) => {
-  if (req.query.secret !== PO_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  const before = pendingSlips.size;
-  await retryPendingSlips();
-  const after = pendingSlips.size;
-  res.json({ status: "ok", before, after, recovered: before - after });
-});
-
 // ─────────────────────────────────────────────
 //  Start server
 // ─────────────────────────────────────────────
@@ -885,16 +916,8 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
 
-  // Self-ping ทุก 14 นาที เพื่อไม่ให้ Render free tier นอนหลับ
   setInterval(() => {
     axios.get(`${RENDER_URL}/`).catch(() => {});
     console.log("Self-ping to stay awake");
   }, 14 * 60 * 1000);
-
-  // Auto-retry slip ที่ค้างในคิว ทุก 5 นาที
-  setInterval(retryPendingSlips, RETRY_INTERVAL_MS);
-  console.log(`🔁 ตั้ง auto-retry pending slips ทุก ${RETRY_INTERVAL_MS / 60000} นาที`);
-
-  // ส่งสรุปสลิปประจำวัน 18:00 BKK (ครอบ 18:01 เมื่อวาน → 18:00 วันนี้)
-  scheduleDailySummary();
 });
