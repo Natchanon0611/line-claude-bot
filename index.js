@@ -460,6 +460,11 @@ async function handleSlipImage(event) {
         '  "amount": "ยอดเงิน เป็นตัวเลขเท่านั้น",\n' +
         '  "ref": "เลข reference ถ้ามี ไม่มีให้ใส่ \\"\\""\n' +
         '}\n' +
+        'กฎวันที่ (สำคัญมาก อ่านให้ตรงเป๊ะ):\n' +
+        '- อ่านวันที่/เดือน/ปี ตามที่ปรากฏบนสลิปเท่านั้น ห้ามเดา ห้ามใช้วันที่วันนี้\n' +
+        '- เดือนไทยย่อ: ม.ค.=01, ก.พ.=02, มี.ค.=03, เม.ย.=04, พ.ค.=05, มิ.ย.=06, ก.ค.=07, ส.ค.=08, ก.ย.=09, ต.ค.=10, พ.ย.=11, ธ.ค.=12\n' +
+        '- ถ้าปีเป็น พ.ศ. (เช่น 2569) ให้ลบ 543 เป็น ค.ศ. (2026) ก่อนใส่ในรูปแบบ YYYY-MM-DD\n' +
+        'กฎชื่อ: ถอดชื่อผู้โอน/ผู้รับตามตัวอักษรที่เห็นจริง ถ้าเป็นบริษัทให้คงคำว่า "บจก./บริษัท" ไว้\n' +
         'ห้ามใส่ markdown code block ตอบเฉพาะ JSON';
 
       const claudeRes = await axios.post(
@@ -916,8 +921,16 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Server running on port " + PORT);
 
+  // Self-ping ทุก 14 นาที กัน Render free tier นอนหลับ
   setInterval(() => {
     axios.get(`${RENDER_URL}/`).catch(() => {});
     console.log("Self-ping to stay awake");
   }, 14 * 60 * 1000);
+
+  // Auto-retry สลิปที่ค้างในคิว ทุก 5 นาที
+  setInterval(retryPendingSlips, RETRY_INTERVAL_MS);
+  console.log(`🔁 ตั้ง auto-retry pending slips ทุก ${RETRY_INTERVAL_MS / 60000} นาที`);
+
+  // ยิงสรุปสลิปประจำวัน 18:00 BKK (ครอบ 18:01 เมื่อวาน → 18:00 วันนี้)
+  scheduleDailySummary();
 });
