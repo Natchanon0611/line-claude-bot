@@ -9,8 +9,13 @@ app.use(express.json({ limit: "20mb" }));
 // ─────────────────────────────────────────────
 const LINE_TOKEN  = process.env.LINE_TOKEN;
 const PO_LOCAL_URL = process.env.PO_LOCAL_URL || "https://yearling-harvest-abreast.ngrok-free.dev";
-const PO_SECRET   = process.env.PO_SECRET    || "fes-po-secret-2026";
+const PO_SECRET   = process.env.PO_SECRET;
 const RENDER_URL  = "https://line-claude-bot-y1jo.onrender.com";
+
+if (!PO_SECRET) {
+  console.error("ERROR: PO_SECRET environment variable is required.");
+  process.exit(1);
+}
 
 // ─── SLIP COLLECTOR — กลุ่ม LINE ที่จะดึงสลิปโอนเงินมาเก็บ ───
 const SLIP_GROUP_ID = process.env.SLIP_GROUP_ID || "";
@@ -20,7 +25,7 @@ let lastLineSource = process.env.LINE_NOTIFY_TARGET || null;
 
 // helper: คืน target สำหรับ push (lastLineSource ก่อน, fallback env, สุดท้าย null)
 function getNotifyTarget() {
-  return lastLineSource || process.env.LINE_NOTIFY_TARGET || null;
+  return process.env.LINE_NOTIFY_TARGET || lastLineSource || null;
 }
 
 // เก็บรูปชั่วคราว (หมดอายุใน 1 ชั่วโมง)
@@ -89,9 +94,6 @@ async function processPOSignResult(data, senderName, notifyId) {
   const send = async (text) => {
     try { await linePush(notifyId, text); } catch (e) {
       console.error("[SEND] linePush failed:", e.response?.status, e.message);
-      try { await lineBroadcast(text); } catch (e2) {
-        console.error("[SEND] broadcast also failed:", e2.response?.status, e2.message);
-      }
     }
   };
 
@@ -128,7 +130,7 @@ async function processPOSignResult(data, senderName, notifyId) {
         imageStore.set(id, item.image_b64);
         setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
         try { await linePushImage(notifyId, `${RENDER_URL}/po-image/${id}`); }
-        catch (e) { await lineBroadcastImage(`${RENDER_URL}/po-image/${id}`).catch(()=>{}); }
+        catch (e) { console.error("[SEND] linePushImage failed:", e.response?.status, e.message); }
       }
       continue;
     }
@@ -162,7 +164,7 @@ async function processPOSignResult(data, senderName, notifyId) {
       imageStore.set(id, item.image_b64);
       setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
       try { await linePushImage(notifyId, `${RENDER_URL}/po-image/${id}`); }
-      catch (e) { await lineBroadcastImage(`${RENDER_URL}/po-image/${id}`).catch(()=>{}); }
+      catch (e) { console.error("[SEND] linePushImage failed:", e.response?.status, e.message); }
     }
   }
 
@@ -717,6 +719,14 @@ app.post("/webhook", async (req, res) => {
 
   if (event.message.type !== "text") return;
 
+  const messageText = (event.message.text || "").trim().toLowerCase();
+  if (messageText === "group id" || messageText === "groupid" || messageText === "source id") {
+    const sourceId = event.source.groupId || event.source.userId || "unknown";
+    const sourceType = event.source.groupId ? "group" : "user";
+    await linePush(sourceId, `LINE ${sourceType} ID:\n${sourceId}`);
+    return;
+  }
+
   // กลุ่มรับสลิป: บอทไม่ตอบข้อความผู้ใช้ — เก็บสลิป + สรุปรายวันอย่างเดียว
   if (SLIP_GROUP_ID && event.source?.groupId === SLIP_GROUP_ID) return;
 
@@ -809,21 +819,31 @@ app.post("/auto-sign-po", async (req, res) => {
 
   const senderName = "ระบบ Auto-Sign";
 
-  // [BROADCAST MODE] ส่งให้ทุก friend ของบอท (1:1 chat) — ไม่ส่งเข้า group
+  // [TARGET MODE] Send only to LINE_NOTIFY_TARGET or the latest chat source.
+  const notifyTarget = getNotifyTarget();
+
   const bsend = async (text) => {
+    if (!notifyTarget) {
+      console.warn("[AUTO-SIGN] no notify target - set LINE_NOTIFY_TARGET to a groupId");
+      return;
+    }
     try {
-      await lineBroadcast(text);
-      console.log(`[AUTO-SIGN] broadcast OK (${String(text).substring(0,30)}...)`);
+      await linePush(notifyTarget, text);
+      console.log(`[AUTO-SIGN] push OK to ${notifyTarget} (${String(text).substring(0,30)}...)`);
     } catch (e) {
-      console.error(`[AUTO-SIGN] broadcast FAILED: ${e.response?.status} ${e.message}`);
+      console.error(`[AUTO-SIGN] push FAILED: ${e.response?.status} ${e.message}`);
     }
   };
   const bsendImage = async (imageUrl) => {
+    if (!notifyTarget) {
+      console.warn("[AUTO-SIGN] no notify target for image - set LINE_NOTIFY_TARGET to a groupId");
+      return;
+    }
     try {
-      await lineBroadcastImage(imageUrl);
-      console.log(`[AUTO-SIGN] broadcast image OK`);
+      await linePushImage(notifyTarget, imageUrl);
+      console.log(`[AUTO-SIGN] push image OK to ${notifyTarget}`);
     } catch (e) {
-      console.error(`[AUTO-SIGN] broadcast image FAILED: ${e.response?.status} ${e.message}`);
+      console.error(`[AUTO-SIGN] push image FAILED: ${e.response?.status} ${e.message}`);
     }
   };
 
