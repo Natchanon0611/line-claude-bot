@@ -517,7 +517,7 @@ async function handleSlipImage(event) {
     }
 
     // ── ไม่ push per-slip แล้ว (ประหยัด LINE quota) ──
-    // ใช้ sendDailySlipSummary() ตอน 18:00 รายงานรวบยอดแทน
+    // ใช้ sendDailySummary() ตอน 18:00 รายงานรวบยอดแทน
 
   } catch (err) {
     console.error("handleSlipImage error:", err.message);
@@ -619,9 +619,9 @@ async function retryPendingSlips() {
 }
 
 // ─────────────────────────────────────────────
-//  Daily Slip Summary v2 — 2 มิ.ย. 2569
+//  Daily Summary v3 — mail documents + money slips
 //  ยิงตอน 18:00 Asia/Bangkok ครอบช่วง 18:01 เมื่อวาน → 18:00 วันนี้ (24h เต็ม)
-//  ใช้ /slip-stats?period_end_date=YYYY-MM-DD ของ Flask
+//  ใช้ /mail-doc-stats + /slip-stats ของ Flask แล้วส่งเข้า SLIP_GROUP_ID เป็นข้อความเดียว
 // ─────────────────────────────────────────────
 
 function getYesterdayBkk(todayYmd) {
@@ -635,7 +635,27 @@ function getYesterdayBkk(todayYmd) {
   return `${yy}-${mm}-${dd}`;
 }
 
-async function sendDailySlipSummary() {
+async function fetchDailyStat(endpoint, today) {
+  try {
+    const res = await axios.get(
+      `${PO_LOCAL_URL}/${endpoint}?period_end_date=${today}`,
+      {
+        headers: { "X-PO-Secret": PO_SECRET, "ngrok-skip-browser-warning": "true" },
+        timeout: 15000,
+      }
+    );
+    return { ok: true, count: res.data?.count ?? 0 };
+  } catch (err) {
+    return { ok: false, count: 0, error: err.message };
+  }
+}
+
+function formatDailyStat(stat, unit) {
+  if (stat.ok) return `${stat.count} ${unit}`;
+  return `ตรวจไม่ได้ (${stat.error})`;
+}
+
+async function sendDailySummary() {
   if (!SLIP_GROUP_ID) return;
 
   // วันที่วันนี้ตามเวลา BKK (สำหรับ period_end_date)
@@ -643,21 +663,23 @@ async function sendDailySlipSummary() {
   const yesterday = getYesterdayBkk(today);
 
   try {
-    const res = await axios.get(
-      `${PO_LOCAL_URL}/slip-stats?period_end_date=${today}`,
-      {
-        headers: { "X-PO-Secret": PO_SECRET, "ngrok-skip-browser-warning": "true" },
-        timeout: 15000,
-      }
-    );
-    const count = res.data?.count ?? 0;
+    const [slipStat, mailDocStat] = await Promise.all([
+      fetchDailyStat("slip-stats", today),
+      fetchDailyStat("mail-doc-stats", today),
+    ]);
+
     await linePush(
       SLIP_GROUP_ID,
-      `📊 สรุปสลิปประจำวัน\n` +
+      `📊 สรุปประจำวัน\n` +
       `🕕 ${yesterday} 18:01 → ${today} 18:00\n` +
-      `📁 เก็บไว้แล้ว ${count} รูป`
+      `📄 เอกสารจากเมล: ${formatDailyStat(mailDocStat, "ไฟล์")}\n` +
+      `🧾 สลิปโอนเงิน: ${formatDailyStat(slipStat, "รูป")}`
     );
-    console.log(`✓ ส่งสรุปรายวัน (period_end ${today}): ${count} รูป`);
+    console.log(
+      `✓ ส่งสรุปรายวัน (period_end ${today}): ` +
+      `mail_docs=${mailDocStat.ok ? mailDocStat.count : "ERR"} ` +
+      `slips=${slipStat.ok ? slipStat.count : "ERR"}`
+    );
   } catch (err) {
     console.error("Daily summary error:", err.message);
   }
@@ -675,10 +697,10 @@ function msUntilNext1800Bangkok() {
 
 function scheduleDailySummary() {
   const delay = msUntilNext1800Bangkok();
-  console.log(`⏰ ตั้งเวลาสรุปสลิปอีก ${Math.round(delay / 60000)} นาที`);
+  console.log(`⏰ ตั้งเวลาสรุปรายวันอีก ${Math.round(delay / 60000)} นาที`);
   setTimeout(async () => {
-    await sendDailySlipSummary();
-    setInterval(sendDailySlipSummary, 24 * 60 * 60 * 1000); // ทุก 24 ชั่วโมง
+    await sendDailySummary();
+    setInterval(sendDailySummary, 24 * 60 * 60 * 1000); // ทุก 24 ชั่วโมง
   }, delay);
 }
 
@@ -951,6 +973,6 @@ app.listen(PORT, () => {
   setInterval(retryPendingSlips, RETRY_INTERVAL_MS);
   console.log(`🔁 ตั้ง auto-retry pending slips ทุก ${RETRY_INTERVAL_MS / 60000} นาที`);
 
-  // ยิงสรุปสลิปประจำวัน 18:00 BKK (ครอบ 18:01 เมื่อวาน → 18:00 วันนี้)
+  // ยิงสรุปเอกสารจากเมล + สลิปประจำวัน 18:00 BKK (ครอบ 18:01 เมื่อวาน → 18:00 วันนี้)
   scheduleDailySummary();
 });
