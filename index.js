@@ -20,12 +20,9 @@ if (!PO_SECRET) {
 // ─── SLIP COLLECTOR — กลุ่ม LINE ที่จะดึงสลิปโอนเงินมาเก็บ ───
 const SLIP_GROUP_ID = process.env.SLIP_GROUP_ID || "";
 
-// เก็บ source ID ล่าสุดสำหรับ push notification
-let lastLineSource = process.env.LINE_NOTIFY_TARGET || null;
-
-// helper: คืน target สำหรับ push (lastLineSource ก่อน, fallback env, สุดท้าย null)
+// Push เฉพาะ target ที่ตั้งค่าไว้เท่านั้น ไม่จำแชตล่าสุดเป็น fallback
 function getNotifyTarget() {
-  return process.env.LINE_NOTIFY_TARGET || lastLineSource || null;
+  return process.env.LINE_NOTIFY_TARGET || process.env.SLIP_GROUP_ID || null;
 }
 
 // เก็บรูปชั่วคราว (หมดอายุใน 1 ชั่วโมง)
@@ -668,6 +665,14 @@ async function sendDailySummary() {
       fetchDailyStat("mail-doc-stats", today),
     ]);
 
+    if (!slipStat.ok && !mailDocStat.ok) {
+      console.error(
+        `Daily summary skipped (period_end ${today}): ` +
+        `mail_docs=${mailDocStat.error || "ERR"} slips=${slipStat.error || "ERR"}`
+      );
+      return;
+    }
+
     await linePush(
       SLIP_GROUP_ID,
       `📊 สรุปประจำวัน\n` +
@@ -730,8 +735,6 @@ app.post("/webhook", async (req, res) => {
   processedMsgIds.add(msgId);
   setTimeout(() => processedMsgIds.delete(msgId), 5 * 60 * 1000);
 
-  lastLineSource = event.source.groupId || event.source.userId;
-
   res.sendStatus(200);
 
   if (event.message.type === "image") {
@@ -781,7 +784,7 @@ app.post("/webhook", async (req, res) => {
       }
     );
     const reply = claude.data.content[0].text || "No response";
-    const replyTarget = lastLineSource || event.source.groupId || event.source.userId;
+    const replyTarget = event.source.groupId || event.source.userId;
     await linePush(replyTarget, reply.substring(0, 1000));
   } catch (error) {
     console.error("Claude ERROR =", error.response?.data || error.message);
@@ -796,7 +799,7 @@ app.post("/notify-new-po", async (req, res) => {
 
   try {
     const target = getNotifyTarget();
-    console.log(`[NOTIFY] target=${target || "NONE"} lastLineSource=${lastLineSource || "null"} env=${process.env.LINE_NOTIFY_TARGET || "unset"}`);
+    console.log(`[NOTIFY] target=${target || "NONE"} notify_env=${process.env.LINE_NOTIFY_TARGET || "unset"} slip_group=${process.env.SLIP_GROUP_ID || "unset"}`);
 
     if (target) {
       try {
@@ -818,7 +821,7 @@ app.post("/notify-new-po", async (req, res) => {
         }
       }
     } else {
-      console.warn("[NOTIFY] no target — set LINE_NOTIFY_TARGET env var or send any message in LINE first");
+      console.warn("[NOTIFY] no target — set LINE_NOTIFY_TARGET or SLIP_GROUP_ID env var");
     }
     res.json({ status: "ok", target: target || null });
   } catch (err) {
@@ -841,12 +844,12 @@ app.post("/auto-sign-po", async (req, res) => {
 
   const senderName = "ระบบ Auto-Sign";
 
-  // [TARGET MODE] Send only to LINE_NOTIFY_TARGET or the latest chat source.
+  // [TARGET MODE] Send only to configured LINE_NOTIFY_TARGET/SLIP_GROUP_ID.
   const notifyTarget = getNotifyTarget();
 
   const bsend = async (text) => {
     if (!notifyTarget) {
-      console.warn("[AUTO-SIGN] no notify target - set LINE_NOTIFY_TARGET to a groupId");
+      console.warn("[AUTO-SIGN] no notify target - set LINE_NOTIFY_TARGET or SLIP_GROUP_ID to a groupId");
       return;
     }
     try {
@@ -858,7 +861,7 @@ app.post("/auto-sign-po", async (req, res) => {
   };
   const bsendImage = async (imageUrl) => {
     if (!notifyTarget) {
-      console.warn("[AUTO-SIGN] no notify target for image - set LINE_NOTIFY_TARGET to a groupId");
+      console.warn("[AUTO-SIGN] no notify target for image - set LINE_NOTIFY_TARGET or SLIP_GROUP_ID to a groupId");
       return;
     }
     try {
