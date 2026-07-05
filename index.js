@@ -641,15 +641,32 @@ async function fetchDailyStat(endpoint, today) {
         timeout: 15000,
       }
     );
-    return { ok: true, count: res.data?.count ?? 0 };
+    return { ok: true, count: res.data?.count ?? 0, rows: res.data?.rows || [] };
   } catch (err) {
-    return { ok: false, count: 0, error: err.message };
+    return { ok: false, count: 0, rows: [], error: err.message };
   }
 }
 
 function formatDailyStat(stat, unit) {
   if (stat.ok) return `${stat.count} ${unit}`;
   return `ตรวจไม่ได้ (${stat.error})`;
+}
+
+function shortText(value, maxLen = 38) {
+  const text = String(value || "-").trim();
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, maxLen - 1)}…`;
+}
+
+function formatMailDocSummary(stat) {
+  if (!stat.ok) return `📄 เอกสารจากเมล: ตรวจไม่ได้ (${stat.error})`;
+  let text = `📄 เอกสารจากเมล: ${stat.count} ไฟล์`;
+  const rows = Array.isArray(stat.rows) ? stat.rows : [];
+  for (const [idx, row] of rows.slice(0, 5).entries()) {
+    text += `\n${idx + 1}. ${shortText(row.entity, 24)} — ${shortText(row.filename, 46)}`;
+  }
+  if (stat.count > 5) text += `\n...และอีก ${stat.count - 5} ไฟล์`;
+  return text;
 }
 
 async function sendDailySummary() {
@@ -677,7 +694,7 @@ async function sendDailySummary() {
       SLIP_GROUP_ID,
       `📊 สรุปประจำวัน\n` +
       `🕕 ${yesterday} 18:01 → ${today} 18:00\n` +
-      `📄 เอกสารจากเมล: ${formatDailyStat(mailDocStat, "ไฟล์")}\n` +
+      `${formatMailDocSummary(mailDocStat)}\n` +
       `🧾 สลิปโอนเงิน: ${formatDailyStat(slipStat, "รูป")}`
     );
     console.log(
