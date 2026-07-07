@@ -126,6 +126,7 @@ async function processPOSignResult(data, senderName, notifyId) {
     timeZone: "Asia/Bangkok", year: "numeric", month: "2-digit", day: "2-digit",
     hour: "2-digit", minute: "2-digit"
   });
+  const modeLine = data.dry_run ? "โหมดทดสอบ: ไม่ปริ้น ไม่ย้าย NAS ไม่ลบต้นฉบับ\n" : "";
 
   for (const item of (data.signed || [])) {
     if (item.needs_confirmation) {
@@ -167,6 +168,7 @@ async function processPOSignResult(data, senderName, notifyId) {
 
     await send(
       `✅ เซ็น PO เสร็จแล้ว\n━━━━━━━━━━━━━━━\n` +
+      modeLine +
       `📄 PO: ${item.po_id}\n` + quotationLine + fileLine +
       `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
       nasLine + printLine + `━━━━━━━━━━━━━━━`
@@ -182,9 +184,13 @@ async function processPOSignResult(data, senderName, notifyId) {
   }
 
   for (const item of (data.failed || [])) {
+    const manualLine = item.manual_file ? `📁 ย้ายไปตรวจมือ: ${item.manual_file}\n` : "";
     await send(
       `❌ เซ็น PO ไม่สำเร็จ\n━━━━━━━━━━━━━━━\n` +
-      `📄 ไฟล์: ${item.file}\n⚠️ สาเหตุ: ${item.error}\n━━━━━━━━━━━━━━━`
+      modeLine +
+      `📄 ไฟล์: ${item.file}\n⚠️ สาเหตุ: ${item.error}\n` +
+      manualLine +
+      `━━━━━━━━━━━━━━━`
     );
   }
 }
@@ -194,9 +200,19 @@ async function processPOSignResult(data, senderName, notifyId) {
 // ─────────────────────────────────────────────
 const SIGN_COMMANDS = ["sign po", "เซ็น po", "sign", "ลงลายเซ็น", "confirm po", "เซ็น"];
 
+function isDryRunSignCommand(text = "") {
+  const lower = String(text).trim().toLowerCase();
+  return lower.includes("dry run") ||
+         lower.includes("dry-run") ||
+         lower.includes("test sign") ||
+         lower.includes("test po") ||
+         lower.includes("ทดสอบเซ็น");
+}
+
 function isSignCommand(text = "") {
   const lower = String(text).trim().toLowerCase();
   if (!lower) return false;
+  if (isDryRunSignCommand(lower)) return true;
   if (/^(sign|sign po|confirm po)$/i.test(lower)) return true;
   if (/\b(sign po|confirm po)\b/i.test(lower)) return true;
   return SIGN_COMMANDS
@@ -207,10 +223,12 @@ function isSignCommand(text = "") {
 async function handlePOSign(event) {
   const text = (event.message?.text || "").trim().toLowerCase();
   if (!isSignCommand(text)) return false;
+  const dryRun = isDryRunSignCommand(text);
 
   const userId     = event.source.userId;
   const groupId    = event.source.groupId || null;
   const notifyId   = groupId || userId;
+  const modePrefix = dryRun ? "[DRY-RUN] " : "";
 
   console.log(`[SIGN] command="${text}" from userId=${userId} groupId=${groupId || "-"}`);
 
@@ -248,23 +266,24 @@ async function handlePOSign(event) {
     pendingSignList = {
       files: poFiles,
       senderName,
+      dryRun,
       sourceId: event.source.groupId || event.source.userId,
       expiresAt: Date.now() + 5 * 60 * 1000,
     };
     const fileList = poFiles.map((f, i) => `${i + 1}. ${f}`).join("\n");
     await lineReply(event.replyToken,
-      `📋 PO ที่รอลงลายเซ็น ${poFiles.length} ไฟล์\n━━━━━━━━━━━━━━━\n${fileList}\n━━━━━━━━━━━━━━━\nตอบเลขที่ต้องการเซ็น เช่น "1 3"\nหรือตอบ "ทั้งหมด"`
+      `${modePrefix}📋 PO ที่รอลงลายเซ็น ${poFiles.length} ไฟล์\n━━━━━━━━━━━━━━━\n${fileList}\n━━━━━━━━━━━━━━━\nตอบเลขที่ต้องการเซ็น เช่น "1 3"\nหรือตอบ "ทั้งหมด"`
     );
     return true;
   }
 
-  await lineReply(event.replyToken, `⏳ กำลังลงลายเซ็น PO\n👤 สั่งโดย: ${senderName}\nรอสักครู่...`);
+  await lineReply(event.replyToken, `${modePrefix}⏳ กำลังลงลายเซ็น PO\n👤 สั่งโดย: ${senderName}\nรอสักครู่...`);
 
   try {
     console.log(`[SIGN] POST ${PO_LOCAL_URL}/sign-po (1 file)`);
     const res = await axios.post(
       `${PO_LOCAL_URL}/sign-po`,
-      { requested_by: userId, selected_files: poFiles },
+      { requested_by: userId, selected_files: poFiles, dry_run: dryRun },
       {
         headers: {
           "X-PO-Secret": PO_SECRET,
@@ -320,7 +339,7 @@ async function handlePOSelection(event) {
   const numTokens = text.split(/[\s,]+/).map(n => parseInt(n)).filter(n => !isNaN(n));
   if (!isAll && numTokens.length === 0) return false;
 
-  const { files, senderName } = pendingSignList;
+  const { files, senderName, dryRun } = pendingSignList;
   let selectedFiles;
 
   if (isAll) {
@@ -339,14 +358,15 @@ async function handlePOSelection(event) {
   pendingSignList = null;
 
   const selNotifyId2 = event.source.groupId || event.source.userId;
-  await lineReply(event.replyToken, `⏳ กำลังลงลายเซ็น ${selectedFiles.length} ไฟล์ รอสักครู่...`);
-  await linePush(selNotifyId2, `⏳ กำลังลงลายเซ็น PO ${selectedFiles.length} ไฟล์\n👤 สั่งโดย: ${senderName}\n${selectedFiles.map((f,i)=>`${i+1}. ${f}`).join("\n")}`).catch(()=>{});
+  const modePrefix = dryRun ? "[DRY-RUN] " : "";
+  await lineReply(event.replyToken, `${modePrefix}⏳ กำลังลงลายเซ็น ${selectedFiles.length} ไฟล์ รอสักครู่...`);
+  await linePush(selNotifyId2, `${modePrefix}⏳ กำลังลงลายเซ็น PO ${selectedFiles.length} ไฟล์\n👤 สั่งโดย: ${senderName}\n${selectedFiles.map((f,i)=>`${i+1}. ${f}`).join("\n")}`).catch(()=>{});
 
   try {
     console.log(`[SIGN-SEL] POST ${PO_LOCAL_URL}/sign-po (${selectedFiles.length} files)`);
     const res = await axios.post(
       `${PO_LOCAL_URL}/sign-po`,
-      { requested_by: event.source.userId, selected_files: selectedFiles },
+      { requested_by: event.source.userId, selected_files: selectedFiles, dry_run: !!dryRun },
       { headers: { "X-PO-Secret": PO_SECRET, "Content-Type": "application/json",
                    "ngrok-skip-browser-warning": "true" }, timeout: SIGN_REQUEST_TIMEOUT_MS }
     );
