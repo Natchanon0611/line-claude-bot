@@ -34,6 +34,18 @@ const pendingConfirmations = new Map();
 // เก็บรายการ PO ที่รอให้ user เลือก
 let pendingSignList = null;
 
+const PO_CODE_PATTERNS = [
+  /(?<![A-Z0-9])PO[._\-\s]?\d+/i,
+  /(?<![A-Z0-9])POUA\d+/i,
+  /(?<![A-Z0-9])FPT\d+/i,
+  /(?<![A-Z0-9])FFT\d+/i,
+];
+
+function isPOFileName(filename = "") {
+  return String(filename).toLowerCase().endsWith(".pdf") &&
+         PO_CODE_PATTERNS.some((pattern) => pattern.test(filename));
+}
+
 // ─────────────────────────────────────────────
 //  LINE Helpers
 // ─────────────────────────────────────────────
@@ -205,7 +217,7 @@ async function handlePOSign(event) {
     const listRes = await axios.post(`${PO_LOCAL_URL}/list-po`, {},
       { headers: { "X-PO-Secret": PO_SECRET, "Content-Type": "application/json",
                    "ngrok-skip-browser-warning": "true" }, timeout: 15000 });
-    poFiles = listRes.data.files || [];
+    poFiles = (listRes.data.files || []).filter(isPOFileName);
     console.log(`[SIGN] got ${poFiles.length} files: ${JSON.stringify(poFiles)}`);
   } catch (e) {
     console.error(`[SIGN] list-po FAILED: ${e.message} (code=${e.code} status=${e.response?.status})`);
@@ -856,6 +868,11 @@ app.post("/auto-sign-po", async (req, res) => {
   if (secret !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
 
   console.log(`[AUTO-SIGN] received: ${filename}`);
+  if (!isPOFileName(filename)) {
+    console.log(`[AUTO-SIGN] ignored non-PO file: ${filename}`);
+    return res.json({ status: "ignored", reason: "not_po_file", filename });
+  }
+
   // ตอบ po_watcher กลับเลย — sign ใช้เวลานาน, ทำ async
   res.json({ status: "accepted", filename });
 
