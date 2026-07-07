@@ -40,6 +40,7 @@ const PO_CODE_PATTERNS = [
   /(?<![A-Z0-9])FPT\d+/i,
   /(?<![A-Z0-9])FFT\d+/i,
 ];
+const SIGN_REQUEST_TIMEOUT_MS = Number(process.env.SIGN_REQUEST_TIMEOUT_MS || 600000);
 
 function isPOFileName(filename = "") {
   return String(filename).toLowerCase().endsWith(".pdf") &&
@@ -114,7 +115,10 @@ async function processPOSignResult(data, senderName, notifyId) {
     await send("✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ");
     return;
   }
-  if (data.status !== "success" || !data.signed?.length) {
+  if (data.status === "ignored") {
+    return;
+  }
+  if ((data.status !== "success" || !data.signed?.length) && !(data.failed || []).length) {
     await send("⚠️ " + (data.message || "เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ"));
   }
 
@@ -190,9 +194,19 @@ async function processPOSignResult(data, senderName, notifyId) {
 // ─────────────────────────────────────────────
 const SIGN_COMMANDS = ["sign po", "เซ็น po", "sign", "ลงลายเซ็น", "confirm po", "เซ็น"];
 
+function isSignCommand(text = "") {
+  const lower = String(text).trim().toLowerCase();
+  if (!lower) return false;
+  if (/^(sign|sign po|confirm po)$/i.test(lower)) return true;
+  if (/\b(sign po|confirm po)\b/i.test(lower)) return true;
+  return SIGN_COMMANDS
+    .filter((cmd) => cmd !== "sign")
+    .some((cmd) => lower.includes(cmd));
+}
+
 async function handlePOSign(event) {
   const text = (event.message?.text || "").trim().toLowerCase();
-  if (!SIGN_COMMANDS.some(cmd => text.includes(cmd))) return false;
+  if (!isSignCommand(text)) return false;
 
   const userId     = event.source.userId;
   const groupId    = event.source.groupId || null;
@@ -231,7 +245,12 @@ async function handlePOSign(event) {
   }
 
   if (poFiles.length > 1) {
-    pendingSignList = { files: poFiles, senderName };
+    pendingSignList = {
+      files: poFiles,
+      senderName,
+      sourceId: event.source.groupId || event.source.userId,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    };
     const fileList = poFiles.map((f, i) => `${i + 1}. ${f}`).join("\n");
     await lineReply(event.replyToken,
       `📋 PO ที่รอลงลายเซ็น ${poFiles.length} ไฟล์\n━━━━━━━━━━━━━━━\n${fileList}\n━━━━━━━━━━━━━━━\nตอบเลขที่ต้องการเซ็น เช่น "1 3"\nหรือตอบ "ทั้งหมด"`
@@ -252,7 +271,7 @@ async function handlePOSign(event) {
           "Content-Type": "application/json",
           "ngrok-skip-browser-warning": "true"
         },
-        timeout: 120000
+        timeout: SIGN_REQUEST_TIMEOUT_MS
       }
     );
 
@@ -286,6 +305,16 @@ async function handlePOSelection(event) {
 
   const text  = (event.message?.text || "").trim();
   const lower = text.toLowerCase();
+  const sourceId = event.source.groupId || event.source.userId;
+
+  if (pendingSignList.expiresAt && Date.now() > pendingSignList.expiresAt) {
+    pendingSignList = null;
+    return false;
+  }
+
+  if (pendingSignList.sourceId && pendingSignList.sourceId !== sourceId) {
+    return false;
+  }
 
   const isAll     = lower === "ทั้งหมด" || lower === "all";
   const numTokens = text.split(/[\s,]+/).map(n => parseInt(n)).filter(n => !isNaN(n));
@@ -319,7 +348,7 @@ async function handlePOSelection(event) {
       `${PO_LOCAL_URL}/sign-po`,
       { requested_by: event.source.userId, selected_files: selectedFiles },
       { headers: { "X-PO-Secret": PO_SECRET, "Content-Type": "application/json",
-                   "ngrok-skip-browser-warning": "true" }, timeout: 120000 }
+                   "ngrok-skip-browser-warning": "true" }, timeout: SIGN_REQUEST_TIMEOUT_MS }
     );
     const data = res.data;
     console.log(`[SIGN-SEL] response status=${data.status} signed=${data.signed?.length || 0}`);
@@ -917,7 +946,7 @@ app.post("/auto-sign-po", async (req, res) => {
           "Content-Type": "application/json",
           "ngrok-skip-browser-warning": "true"
         },
-        timeout: 180000
+        timeout: SIGN_REQUEST_TIMEOUT_MS
       }
     );
 
@@ -930,6 +959,13 @@ app.post("/auto-sign-po", async (req, res) => {
     }
     if (data.status === "no_files") {
       await bsend(`✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ`);
+      return;
+    }
+    if (data.status === "ignored") {
+      return;
+    }
+    if (data.status !== "success" && !(data.failed || []).length) {
+      await bsend(`⚠️ Auto-sign มีข้อผิดพลาด\n━━━━━━━━━━━━━━━\n📄 ไฟล์: ${filename}\n⚠️ ${data.message || "ไม่ทราบสาเหตุ"}\n━━━━━━━━━━━━━━━`);
       return;
     }
 
