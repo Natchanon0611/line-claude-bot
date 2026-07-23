@@ -41,6 +41,12 @@ const PO_CODE_PATTERNS = [
   /(?<![A-Z0-9])FFT\d+/i,
 ];
 const SIGN_REQUEST_TIMEOUT_MS = Number(process.env.SIGN_REQUEST_TIMEOUT_MS || 600000);
+const AUTO_SIGN_MAX_ATTEMPTS = Math.max(1, Number(process.env.AUTO_SIGN_MAX_ATTEMPTS || 8));
+const AUTO_SIGN_BUSY_RETRY_MS = Math.max(5000, Number(process.env.AUTO_SIGN_BUSY_RETRY_MS || 45000));
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function isPOFileName(filename = "") {
   return String(filename).toLowerCase().endsWith(".pdf") &&
@@ -158,6 +164,10 @@ async function processPOSignResult(data, senderName, notifyId) {
     } else {
       quotationLine = `📋 ใบเสนอราคา: ไม่พบที่ตรงกันใน NAS ⚠️\n`;
     }
+    const quotationMoveLine = item.quotation_moved
+                        ? `📁 ย้ายใบเสนอราคาเข้า V2-2 แล้ว ✓\n`
+                        : item.quotation_move_error ? `📁 ย้ายใบเสนอราคาเข้า V2-2 ไม่สำเร็จ ✗ (${item.quotation_move_error})\n` : "";
+    const factoryLine = item.factory ? `🏭 โรงงาน: ${item.factory}\n` : "";
 
     const nasLine   = item.nas_ok
                         ? `📂 NAS: คัดลอกแล้ว ✓\n${item.nas_path ? `   ${item.nas_path}\n` : ""}`
@@ -165,11 +175,13 @@ async function processPOSignResult(data, senderName, notifyId) {
     const printLine = item.print_ok    ? "🖨️  ปริ้น: สั่งแล้ว ✓\n"
                     : item.print_error ? `🖨️  ปริ้น: ล้มเหลว ✗ (${item.print_error})\n` : "";
     const fileLine  = item.output_file ? `📄 ไฟล์: ${item.output_file}\n` : "";
+    const waitingLine = item.output_file?.startsWith("W-")
+                    ? "⏳ สถานะ: รอตรวจ ก่อนส่งเมลยืนยัน\n" : "";
 
     await send(
       `✅ เซ็น PO เสร็จแล้ว\n━━━━━━━━━━━━━━━\n` +
       modeLine +
-      `📄 PO: ${item.po_id}\n` + quotationLine + fileLine +
+      `📄 PO: ${item.po_id}\n` + quotationLine + factoryLine + quotationMoveLine + fileLine + waitingLine +
       `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
       nasLine + printLine + `━━━━━━━━━━━━━━━`
     );
@@ -956,25 +968,34 @@ app.post("/auto-sign-po", async (req, res) => {
   };
 
   try {
-    console.log(`[AUTO-SIGN] POST ${PO_LOCAL_URL}/sign-po (1 file)`);
-    const signRes = await axios.post(
-      `${PO_LOCAL_URL}/sign-po`,
-      { requested_by: "auto-watcher", selected_files: [filename] },
-      {
-        headers: {
-          "X-PO-Secret": PO_SECRET,
-          "Content-Type": "application/json",
-          "ngrok-skip-browser-warning": "true"
-        },
-        timeout: SIGN_REQUEST_TIMEOUT_MS
-      }
-    );
+    let data = null;
+    for (let attempt = 1; attempt <= AUTO_SIGN_MAX_ATTEMPTS; attempt++) {
+      console.log(`[AUTO-SIGN] POST ${PO_LOCAL_URL}/sign-po (1 file, attempt ${attempt}/${AUTO_SIGN_MAX_ATTEMPTS})`);
+      const signRes = await axios.post(
+        `${PO_LOCAL_URL}/sign-po`,
+        { requested_by: "auto-watcher", selected_files: [filename] },
+        {
+          headers: {
+            "X-PO-Secret": PO_SECRET,
+            "Content-Type": "application/json",
+            "ngrok-skip-browser-warning": "true"
+          },
+          timeout: SIGN_REQUEST_TIMEOUT_MS
+        }
+      );
 
-    const data = signRes.data;
+      data = signRes.data;
+      if (data.status !== "busy") break;
+      if (attempt < AUTO_SIGN_MAX_ATTEMPTS) {
+        console.log(`[AUTO-SIGN] local signer busy; retry in ${AUTO_SIGN_BUSY_RETRY_MS / 1000}s`);
+        await sleep(AUTO_SIGN_BUSY_RETRY_MS);
+      }
+    }
+
     console.log(`[AUTO-SIGN] response: status=${data.status} signed=${data.signed?.length || 0} failed=${data.failed?.length || 0}`);
 
     if (data.status === "busy") {
-      await bsend(`⚠️ กำลังลงลายเซ็นอยู่แล้วครับ\n👤 สั่งโดย: ${senderName}`);
+      await bsend(`⚠️ Auto-sign ยังชนงานเซ็นที่กำลังรันอยู่หลัง retry แล้ว\n━━━━━━━━━━━━━━━\n📄 ไฟล์: ${filename}\n👤 สั่งโดย: ${senderName}\nระบบ watcher จะลองส่งใหม่ถ้าไฟล์ยังค้างอยู่`);
       return;
     }
     if (data.status === "no_files") {
@@ -1004,6 +1025,10 @@ app.post("/auto-sign-po", async (req, res) => {
       } else {
         quotationLine = `📋 ใบเสนอราคา: ไม่พบที่ตรงกันใน NAS ⚠️\n`;
       }
+      const quotationMoveLine = item.quotation_moved
+                          ? `📁 ย้ายใบเสนอราคาเข้า V2-2 แล้ว ✓\n`
+                          : item.quotation_move_error ? `📁 ย้ายใบเสนอราคาเข้า V2-2 ไม่สำเร็จ ✗ (${item.quotation_move_error})\n` : "";
+      const factoryLine = item.factory ? `🏭 โรงงาน: ${item.factory}\n` : "";
 
       const nasLine   = item.nas_ok
                           ? `📂 NAS: คัดลอกแล้ว ✓\n${item.nas_path ? `   ${item.nas_path}\n` : ""}`
@@ -1011,10 +1036,12 @@ app.post("/auto-sign-po", async (req, res) => {
       const printLine = item.print_ok    ? "🖨️  ปริ้น: สั่งแล้ว ✓\n"
                       : item.print_error ? `🖨️  ปริ้น: ล้มเหลว ✗ (${item.print_error})\n` : "";
       const fileLine  = item.output_file ? `📄 ไฟล์: ${item.output_file}\n` : "";
+      const waitingLine = item.output_file?.startsWith("W-")
+                      ? "⏳ สถานะ: รอตรวจ ก่อนส่งเมลยืนยัน\n" : "";
 
       await bsend(
         `✅ เซ็น PO เสร็จแล้ว\n━━━━━━━━━━━━━━━\n` +
-        `📄 PO: ${item.po_id}\n` + quotationLine + fileLine +
+        `📄 PO: ${item.po_id}\n` + quotationLine + factoryLine + quotationMoveLine + fileLine + waitingLine +
         `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
         nasLine + printLine + `━━━━━━━━━━━━━━━`
       );
@@ -1038,6 +1065,26 @@ app.post("/auto-sign-po", async (req, res) => {
     await bsend(
       `❌ Auto-sign ล้มเหลว\n━━━━━━━━━━━━━━━\n📄 ไฟล์: ${filename}\n⚠️ ${err.message}\n━━━━━━━━━━━━━━━`
     );
+  }
+});
+
+app.post("/po-mail-result", async (req, res) => {
+  const { secret, text } = req.body || {};
+  if (secret !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
+
+  const notifyTarget = getNotifyTarget();
+  if (!notifyTarget) {
+    console.warn("[PO-MAIL] no notify target - set LINE_NOTIFY_TARGET or SLIP_GROUP_ID");
+    return res.json({ status: "no_target" });
+  }
+
+  try {
+    await linePush(notifyTarget, String(text || "สรุปส่งเมล PO ว่าง").substring(0, 2000));
+    console.log("[PO-MAIL] result pushed");
+    return res.json({ status: "ok" });
+  } catch (err) {
+    console.error("[PO-MAIL] push failed:", err.response?.status, err.message);
+    return res.status(500).json({ status: "error", message: err.message });
   }
 });
 
