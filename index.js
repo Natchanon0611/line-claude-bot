@@ -1083,8 +1083,15 @@ app.post("/po-mail-result", async (req, res) => {
     console.log("[PO-MAIL] result pushed");
     return res.json({ status: "ok" });
   } catch (err) {
-    console.error("[PO-MAIL] push failed:", err.response?.status, err.message);
-    return res.status(500).json({ status: "error", message: err.message });
+    const lineStatus = err.response?.status || 0;
+    const lineBody = err.response?.data || null;
+    console.error("[PO-MAIL] push failed:", lineStatus, err.message, lineBody);
+    return res.json({
+      status: "line_push_failed",
+      line_status: lineStatus,
+      reason: lineStatus === 429 ? "line_quota_or_rate_limit" : "line_push_error",
+      message: err.message,
+    });
   }
 });
 
