@@ -518,68 +518,18 @@ async function handleSlipImage(event) {
     );
 
     const imgBuffer = Buffer.from(imgRes.data);
-    const imgB64    = imgBuffer.toString("base64");
     console.log(`  size: ${(imgBuffer.length / 1024).toFixed(1)} KB`);
-
-    let slipData = { date: "", sender: "", recipient: "", amount: "", ref: "" };
-    try {
-      const ocrPrompt =
-        'อ่านสลิปโอนเงินไทยนี้แล้วตอบเป็น JSON เท่านั้น (ไม่มี markdown, ไม่มีคำอธิบาย):\n' +
-        '{\n' +
-        '  "date": "YYYY-MM-DD",\n' +
-        '  "sender": "ชื่อผู้โอน/บัญชีต้นทาง",\n' +
-        '  "recipient": "ชื่อผู้รับ/บัญชีปลายทาง",\n' +
-        '  "amount": "ยอดเงิน เป็นตัวเลขเท่านั้น",\n' +
-        '  "ref": "เลข reference ถ้ามี ไม่มีให้ใส่ \\"\\""\n' +
-        '}\n' +
-        'กฎวันที่ (สำคัญมาก อ่านให้ตรงเป๊ะ):\n' +
-        '- อ่านวันที่/เดือน/ปี ตามที่ปรากฏบนสลิปเท่านั้น ห้ามเดา ห้ามใช้วันที่วันนี้\n' +
-        '- เดือนไทยย่อ: ม.ค.=01, ก.พ.=02, มี.ค.=03, เม.ย.=04, พ.ค.=05, มิ.ย.=06, ก.ค.=07, ส.ค.=08, ก.ย.=09, ต.ค.=10, พ.ย.=11, ธ.ค.=12\n' +
-        '- ถ้าปีเป็น พ.ศ. (เช่น 2569) ให้ลบ 543 เป็น ค.ศ. (2026) ก่อนใส่ในรูปแบบ YYYY-MM-DD\n' +
-        'กฎชื่อ: ถอดชื่อผู้โอน/ผู้รับตามตัวอักษรที่เห็นจริง ถ้าเป็นบริษัทให้คงคำว่า "บจก./บริษัท" ไว้\n' +
-        'ห้ามใส่ markdown code block ตอบเฉพาะ JSON';
-
-      const claudeRes = await axios.post(
-        "https://api.anthropic.com/v1/messages",
-        {
-          model: "claude-haiku-4-5",
-          max_tokens: 500,
-          messages: [{
-            role: "user",
-            content: [
-              { type: "image", source: { type: "base64", media_type: "image/jpeg", data: imgB64 } },
-              { type: "text",  text: ocrPrompt }
-            ]
-          }]
-        },
-        {
-          headers: {
-            "x-api-key": process.env.CLAUDE_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-          },
-          timeout: 30000,
-        }
-      );
-
-      let rawText = claudeRes.data.content[0].text.trim();
-      rawText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
-      slipData = JSON.parse(rawText);
-      console.log(`  OCR: ${JSON.stringify(slipData)}`);
-    } catch (e) {
-      console.error("  OCR failed:", e.message);
-    }
 
     let savedFilename = null;
     try {
-      savedFilename = await uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId, slipData });
+      savedFilename = await uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId });
       console.log(`  ✓ บันทึกแล้ว: ${savedFilename}`);
     } catch (saveErr) {
       console.error("  ⚠️ save-slip failed:", saveErr.response?.data || saveErr.message);
-      // เก็บเข้าคิว retry — เก็บแค่ messageId + slipData (ไม่เก็บ imgBuffer เพื่อประหยัด memory)
+      // เก็บเข้าคิว retry — เก็บแค่ messageId (ไม่เก็บ imgBuffer เพื่อประหยัด memory)
       // ตอน retry จะดาวน์โหลดรูปจาก LINE ใหม่ (รูปอยู่บน LINE 14 วัน)
       pendingSlips.set(messageId, {
-        userId, timestamp, slipData,
+        userId, timestamp,
         addedAt: Date.now(),
         retries: 0,
       });
@@ -601,7 +551,7 @@ async function handleSlipImage(event) {
 // ─────────────────────────────────────────────
 
 // คิวสำหรับสลิปที่ save ไม่สำเร็จ (เช่น Flask down / ngrok down)
-// key = messageId, value = {userId, timestamp, slipData, addedAt, retries}
+// key = messageId, value = {userId, timestamp, addedAt, retries}
 const pendingSlips = new Map();
 
 const RETRY_INTERVAL_MS  = 5 * 60 * 1000;  // retry ทุก 5 นาที
@@ -611,7 +561,7 @@ const RETRY_MAX_AGE_HOURS = 12;             // ลบจากคิวถ้า
  * อัพโหลดสลิปไป Flask
  * ถ้า imgBuffer ไม่มี (กรณี retry) จะดาวน์โหลดจาก LINE Content API ใหม่
  */
-async function uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId, slipData }) {
+async function uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId }) {
   // ถ้าไม่มี buffer → ดาวน์โหลดจาก LINE ใหม่ (กรณี retry)
   if (!imgBuffer) {
     const imgRes = await axios.get(
@@ -629,11 +579,6 @@ async function uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId, slip
     user_id:        userId || "RECOVERY",
     timestamp:      String(timestamp || Date.now()),
     message_id:     messageId,
-    slip_date:      slipData?.date      || "",
-    slip_sender:    slipData?.sender    || "",
-    slip_recipient: slipData?.recipient || "",
-    slip_amount:    String(slipData?.amount || ""),
-    slip_ref:       slipData?.ref       || "",
   }).toString();
 
   const saveRes = await axios.post(
@@ -677,7 +622,6 @@ async function retryPendingSlips() {
         userId:    info.userId,
         timestamp: info.timestamp,
         messageId,
-        slipData:  info.slipData,
       });
       console.log(`  ✓ retry สำเร็จ: ${filename} (${messageId})`);
       pendingSlips.delete(messageId);
