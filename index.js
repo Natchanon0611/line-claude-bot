@@ -1,5 +1,7 @@
 const express = require("express");
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 const app = express();
 
 app.use(express.json({ limit: "20mb" }));
@@ -10,7 +12,7 @@ app.use(express.json({ limit: "20mb" }));
 const LINE_TOKEN  = process.env.LINE_TOKEN;
 const PO_LOCAL_URL = process.env.PO_LOCAL_URL || "https://yearling-harvest-abreast.ngrok-free.dev";
 const PO_SECRET   = process.env.PO_SECRET;
-const RENDER_URL  = "https://line-claude-bot-y1jo.onrender.com";
+const RENDER_URL  = process.env.RENDER_URL || "https://line-claude-bot-y1jo.onrender.com";
 
 if (!PO_SECRET) {
   console.error("ERROR: PO_SECRET environment variable is required.");
@@ -20,13 +22,39 @@ if (!PO_SECRET) {
 // ─── SLIP COLLECTOR — กลุ่ม LINE ที่จะดึงสลิปโอนเงินมาเก็บ ───
 const SLIP_GROUP_ID = process.env.SLIP_GROUP_ID || "";
 
+function isLineGroupId(id) {
+  return typeof id === "string" && id.startsWith("C");
+}
+
 // Push เฉพาะ target ที่ตั้งค่าไว้เท่านั้น ไม่จำแชตล่าสุดเป็น fallback
 function getNotifyTarget() {
-  return process.env.LINE_NOTIFY_TARGET || process.env.SLIP_GROUP_ID || null;
+  const configuredTargets = [process.env.LINE_NOTIFY_TARGET, process.env.SLIP_GROUP_ID];
+  const groupTarget = configuredTargets.find(isLineGroupId);
+  if (!groupTarget && configuredTargets.some(Boolean)) {
+    console.warn("[LINE] notify target ignored because it is not a groupId");
+  }
+  return groupTarget || null;
 }
 
 // เก็บรูปชั่วคราว (หมดอายุใน 1 ชั่วโมง)
 const imageStore = new Map();
+const IMAGE_CACHE_DIR = process.env.PO_IMAGE_CACHE_DIR || path.join(__dirname, "logs", "po_images");
+
+function storePoImage(imageB64) {
+  const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  imageStore.set(id, imageB64);
+  try {
+    fs.mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
+    fs.writeFileSync(path.join(IMAGE_CACHE_DIR, `${id}.jpg`), Buffer.from(imageB64, "base64"));
+  } catch (err) {
+    console.warn(`[PO-IMAGE] disk cache write failed: ${err.message}`);
+  }
+  setTimeout(() => {
+    imageStore.delete(id);
+    fs.rm(path.join(IMAGE_CACHE_DIR, `${id}.jpg`), { force: true }, () => {});
+  }, 60 * 60 * 1000);
+  return id;
+}
 
 // เก็บ PO ที่รอยืนยันลายเซ็น
 const pendingConfirmations = new Map();
@@ -65,6 +93,10 @@ async function lineReply(replyToken, text) {
 }
 
 async function linePush(to, text) {
+  if (!isLineGroupId(to)) {
+    console.warn(`[LINE] blocked push to non-group target: ${to || "EMPTY"}`);
+    return { skipped: true, reason: "non_group_target" };
+  }
   await axios.post(
     "https://api.line.me/v2/bot/message/push",
     { to, messages: [{ type: "text", text: String(text).substring(0, 2000) }] },
@@ -73,6 +105,10 @@ async function linePush(to, text) {
 }
 
 async function linePushImage(to, imageUrl) {
+  if (!isLineGroupId(to)) {
+    console.warn(`[LINE] blocked image push to non-group target: ${to || "EMPTY"}`);
+    return { skipped: true, reason: "non_group_target" };
+  }
   await axios.post(
     "https://api.line.me/v2/bot/message/push",
     {
@@ -87,20 +123,33 @@ async function linePushImage(to, imageUrl) {
   );
 }
 
-async function lineBroadcast(text) {
+async function linePushFlex(to, altText, contents) {
+  if (!isLineGroupId(to)) {
+    console.warn(`[LINE] blocked flex push to non-group target: ${to || "EMPTY"}`);
+    return { skipped: true, reason: "non_group_target" };
+  }
   await axios.post(
-    "https://api.line.me/v2/bot/message/broadcast",
-    { messages: [{ type: "text", text: String(text).substring(0, 2000) }] },
+    "https://api.line.me/v2/bot/message/push",
+    {
+      to,
+      messages: [{
+        type: "flex",
+        altText: String(altText || "สรุปรายวัน").substring(0, 400),
+        contents,
+      }],
+    },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
   );
 }
 
+async function lineBroadcast(text) {
+  console.warn("[LINE] blocked broadcast; notifications are group-only");
+  return { skipped: true, reason: "broadcast_disabled" };
+}
+
 async function lineBroadcastImage(imageUrl) {
-  await axios.post(
-    "https://api.line.me/v2/bot/message/broadcast",
-    { messages: [{ type: "image", originalContentUrl: imageUrl, previewImageUrl: imageUrl }] },
-    { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
-  );
+  console.warn("[LINE] blocked image broadcast; notifications are group-only");
+  return { skipped: true, reason: "broadcast_disabled" };
 }
 
 // ─────────────────────────────────────────────
@@ -146,9 +195,7 @@ async function processPOSignResult(data, senderName, notifyId) {
         `ตรวจสอบรูปด้านล่าง แล้วตอบ:\n✅ "ยืนยัน" — ส่งเมล + ปริ้น\n❌ "ยกเลิก" — ลบและส่ง PO ใหม่`
       );
       if (item.image_b64) {
-        const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-        imageStore.set(id, item.image_b64);
-        setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
+        const id = storePoImage(item.image_b64);
         try { await linePushImage(notifyId, `${RENDER_URL}/po-image/${id}`); }
         catch (e) { console.error("[SEND] linePushImage failed:", e.response?.status, e.message); }
       }
@@ -187,9 +234,7 @@ async function processPOSignResult(data, senderName, notifyId) {
     );
 
     if (item.image_b64) {
-      const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      imageStore.set(id, item.image_b64);
-      setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
+      const id = storePoImage(item.image_b64);
       try { await linePushImage(notifyId, `${RENDER_URL}/po-image/${id}`); }
       catch (e) { console.error("[SEND] linePushImage failed:", e.response?.status, e.message); }
     }
@@ -635,7 +680,7 @@ async function retryPendingSlips() {
 // ─────────────────────────────────────────────
 //  Daily Summary v3 — mail documents + money slips
 //  ยิงตอน 18:00 Asia/Bangkok ครอบช่วง 18:01 เมื่อวาน → 18:00 วันนี้ (24h เต็ม)
-//  ใช้ /mail-doc-stats + /slip-stats ของ Flask แล้วส่งเข้า SLIP_GROUP_ID เป็นข้อความเดียว
+//  ใช้ /mail-doc-stats + /slip-stats ของ Flask แล้วส่งเข้า SLIP_GROUP_ID เป็น Flex ตารางเดียว
 // ─────────────────────────────────────────────
 
 function getYesterdayBkk(todayYmd) {
@@ -664,26 +709,136 @@ async function fetchDailyStat(endpoint, today) {
   }
 }
 
-function formatDailyStat(stat, unit) {
-  if (stat.ok) return `${stat.count} ${unit}`;
-  return `ตรวจไม่ได้ (${stat.error})`;
-}
-
 function shortText(value, maxLen = 38) {
   const text = String(value || "-").trim();
   if (text.length <= maxLen) return text;
   return `${text.slice(0, maxLen - 1)}…`;
 }
 
-function formatMailDocSummary(stat) {
-  if (!stat.ok) return `📄 เอกสารจากเมล: ตรวจไม่ได้ (${stat.error})`;
-  let text = `📄 เอกสารจากเมล: ${stat.count} ไฟล์`;
-  const rows = Array.isArray(stat.rows) ? stat.rows : [];
-  for (const [idx, row] of rows.slice(0, 5).entries()) {
-    text += `\n${idx + 1}. ${shortText(row.entity, 24)} — ${shortText(row.filename, 46)}`;
+const THAI_MONTHS_SHORT = [
+  "ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
+  "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.",
+];
+
+function formatThaiDate(ymd) {
+  const [y, m, d] = String(ymd || "").split("-").map(Number);
+  if (!y || !m || !d) return String(ymd || "-");
+  return `${d} ${THAI_MONTHS_SHORT[m - 1]} ${y + 543}`;
+}
+
+function flexText(text, options = {}) {
+  return {
+    type: "text",
+    text: String(text ?? "-"),
+    wrap: options.wrap ?? true,
+    ...options,
+  };
+}
+
+function buildDailySummaryFlex(mailDocStat, slipStat, today, yesterday) {
+  const docsOk = !!mailDocStat.ok;
+  const rows = docsOk && Array.isArray(mailDocStat.rows) ? mailDocStat.rows : [];
+  const countText = docsOk ? `ดาวน์โหลดทั้งหมด ${mailDocStat.count} ไฟล์` : `ตรวจเอกสารไม่ได้ (${mailDocStat.error})`;
+  const slipText = slipStat.ok ? `สลิปโอนเงิน ${slipStat.count} รูป` : `สลิปโอนเงินตรวจไม่ได้`;
+
+  const bodyContents = [
+    {
+      type: "box",
+      layout: "horizontal",
+      contents: [
+        flexText("#", { size: "xs", weight: "bold", flex: 1, color: "#555555", wrap: false }),
+        flexText("หน่วยงาน", { size: "xs", weight: "bold", flex: 4, color: "#555555" }),
+        flexText("ไฟล์", { size: "xs", weight: "bold", flex: 6, color: "#555555" }),
+      ],
+    },
+    { type: "separator", margin: "xs" },
+  ];
+
+  if (!docsOk) {
+    bodyContents.push({
+      type: "box",
+      layout: "horizontal",
+      margin: "sm",
+      contents: [
+        flexText("!", { size: "xs", flex: 1, color: "#B00020", wrap: false }),
+        flexText("ระบบ", { size: "xs", flex: 4, color: "#B00020" }),
+        flexText(mailDocStat.error || "ตรวจไม่ได้", { size: "xs", flex: 6, color: "#B00020" }),
+      ],
+    });
+  } else if (rows.length === 0) {
+    bodyContents.push({
+      type: "box",
+      layout: "horizontal",
+      margin: "sm",
+      contents: [
+        flexText("-", { size: "xs", flex: 1, color: "#888888", wrap: false }),
+        flexText("-", { size: "xs", flex: 4, color: "#888888" }),
+        flexText("ไม่มีไฟล์เอกสารใหม่", { size: "xs", flex: 6, color: "#888888" }),
+      ],
+    });
+  } else {
+    for (const [idx, row] of rows.slice(0, 10).entries()) {
+      bodyContents.push({
+        type: "box",
+        layout: "horizontal",
+        margin: "sm",
+        contents: [
+          flexText(String(idx + 1), { size: "xs", flex: 1, color: "#555555", wrap: false }),
+          flexText(shortText(row.entity, 34), { size: "xs", flex: 4 }),
+          flexText(shortText(row.filename, 64), { size: "xs", flex: 6 }),
+        ],
+      });
+    }
+    if (mailDocStat.count > rows.length) {
+      bodyContents.push({ type: "separator", margin: "sm" });
+      bodyContents.push(flexText(`... และอีก ${mailDocStat.count - rows.length} ไฟล์`, {
+        size: "xs",
+        color: "#888888",
+        align: "center",
+        margin: "sm",
+      }));
+    }
   }
-  if (stat.count > 5) text += `\n...และอีก ${stat.count - 5} ไฟล์`;
-  return text;
+
+  return {
+    type: "bubble",
+    size: "giga",
+    header: {
+      type: "box",
+      layout: "vertical",
+      paddingAll: "lg",
+      backgroundColor: "#F5F5F5",
+      contents: [
+        flexText("📥 สรุปการดาวน์โหลดเอกสาร", {
+          weight: "bold",
+          size: "md",
+          color: "#1F1F1F",
+        }),
+        flexText(`📅 ${formatThaiDate(today)}`, {
+          size: "sm",
+          color: "#888888",
+          margin: "sm",
+        }),
+        flexText(countText, {
+          size: "sm",
+          weight: "bold",
+          color: "#0066CC",
+          margin: "sm",
+        }),
+        flexText(`${yesterday} 18:01 → ${today} 18:00 • ${slipText}`, {
+          size: "xxs",
+          color: "#888888",
+          margin: "xs",
+        }),
+      ],
+    },
+    body: {
+      type: "box",
+      layout: "vertical",
+      paddingAll: "md",
+      contents: bodyContents,
+    },
+  };
 }
 
 async function sendDailySummary() {
@@ -707,12 +862,10 @@ async function sendDailySummary() {
       return;
     }
 
-    await linePush(
+    await linePushFlex(
       SLIP_GROUP_ID,
-      `📊 สรุปประจำวัน\n` +
-      `🕕 ${yesterday} 18:01 → ${today} 18:00\n` +
-      `${formatMailDocSummary(mailDocStat)}\n` +
-      `🧾 สลิปโอนเงิน: ${formatDailyStat(slipStat, "รูป")}`
+      `สรุปดาวน์โหลด ${mailDocStat.ok ? mailDocStat.count : 0} ไฟล์ ประจำวันที่ ${formatThaiDate(today)}`,
+      buildDailySummaryFlex(mailDocStat, slipStat, today, yesterday)
     );
     console.log(
       `✓ ส่งสรุปรายวัน (period_end ${today}): ` +
@@ -758,6 +911,11 @@ app.post("/webhook", async (req, res) => {
   console.log("EVENT =", JSON.stringify(req.body));
 
   if (!event || event.type !== "message") {
+    return res.sendStatus(200);
+  }
+
+  if (!isLineGroupId(event.source?.groupId)) {
+    console.log(`[LINE] ignored non-group message from source=${event.source?.userId || event.source?.roomId || "unknown"}`);
     return res.sendStatus(200);
   }
 
@@ -843,9 +1001,7 @@ app.post("/notify-new-po", async (req, res) => {
         console.error(`[NOTIFY] text push FAILED: ${e.response?.status} ${e.message}`);
       }
       if (image_b64) {
-        const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-        imageStore.set(id, image_b64);
-        setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
+        const id = storePoImage(image_b64);
         const imageUrl = `${RENDER_URL}/po-image/${id}`;
         try {
           await linePushImage(target, imageUrl);
@@ -991,9 +1147,7 @@ app.post("/auto-sign-po", async (req, res) => {
       );
 
       if (item.image_b64) {
-        const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-        imageStore.set(id, item.image_b64);
-        setTimeout(() => imageStore.delete(id), 60 * 60 * 1000);
+        const id = storePoImage(item.image_b64);
         await bsendImage(`${RENDER_URL}/po-image/${id}`);
       }
     }
@@ -1040,10 +1194,17 @@ app.post("/po-mail-result", async (req, res) => {
 });
 
 app.get("/po-image/:id", (req, res) => {
-  const data = imageStore.get(req.params.id);
-  if (!data) return res.status(404).send("Not found or expired");
-  const buf = Buffer.from(data, "base64");
+  let data = imageStore.get(req.params.id);
+  let buf = data ? Buffer.from(data, "base64") : null;
+  if (!buf) {
+    const cachedPath = path.join(IMAGE_CACHE_DIR, `${req.params.id}.jpg`);
+    if (fs.existsSync(cachedPath)) {
+      buf = fs.readFileSync(cachedPath);
+    }
+  }
+  if (!buf) return res.status(404).send("Not found or expired");
   res.set("Content-Type", "image/jpeg");
+  res.set("Cache-Control", "public, max-age=3600");
   res.send(buf);
 });
 
