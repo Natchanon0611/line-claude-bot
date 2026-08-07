@@ -13,6 +13,7 @@ const LINE_TOKEN  = process.env.LINE_TOKEN;
 const PO_LOCAL_URL = process.env.PO_LOCAL_URL || "https://yearling-harvest-abreast.ngrok-free.dev";
 const PO_SECRET   = process.env.PO_SECRET;
 const RENDER_URL  = process.env.RENDER_URL || "https://line-claude-bot-y1jo.onrender.com";
+let cachedBotUserId = process.env.LINE_BOT_USER_ID || "";
 
 if (!PO_SECRET) {
   console.error("ERROR: PO_SECRET environment variable is required.");
@@ -21,6 +22,8 @@ if (!PO_SECRET) {
 
 // ─── SLIP COLLECTOR — กลุ่ม LINE ที่จะดึงสลิปโอนเงินมาเก็บ ───
 const SLIP_GROUP_ID = process.env.SLIP_GROUP_ID || "";
+const DOWNLOADABLE_LINE_TYPES = new Set(["image", "file", "video", "audio"]);
+const LINE_DOC_MAX_BYTES = Number(process.env.LINE_DOC_MAX_BYTES || 50 * 1024 * 1024);
 
 function isLineGroupId(id) {
   return typeof id === "string" && id.startsWith("C");
@@ -140,6 +143,27 @@ async function linePushFlex(to, altText, contents) {
     },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
   );
+}
+
+async function getBotUserId() {
+  if (cachedBotUserId) return cachedBotUserId;
+  try {
+    const res = await axios.get(
+      "https://api.line.me/v2/bot/info",
+      { headers: { Authorization: `Bearer ${LINE_TOKEN}` }, timeout: 10000 }
+    );
+    cachedBotUserId = res.data?.userId || "";
+  } catch (err) {
+    console.warn("[LINE] cannot fetch bot info for self-message guard:", err.response?.status || err.message);
+  }
+  return cachedBotUserId;
+}
+
+async function isFromThisBot(event) {
+  const senderId = event.source?.userId || "";
+  if (!senderId) return false;
+  const botUserId = await getBotUserId();
+  return !!botUserId && senderId === botUserId;
 }
 
 async function lineBroadcast(text) {
@@ -542,50 +566,51 @@ async function handlePOPrint(event) {
 // ─────────────────────────────────────────────
 //  Slip Image Handler
 // ─────────────────────────────────────────────
-async function handleSlipImage(event) {
-  if (event.type !== "message" || event.message?.type !== "image") return false;
+async function handleLineAttachment(event) {
+  if (event.type !== "message" || !DOWNLOADABLE_LINE_TYPES.has(event.message?.type)) return false;
   if (!SLIP_GROUP_ID || event.source?.groupId !== SLIP_GROUP_ID) return false;
 
   const messageId = event.message.id;
   const userId    = event.source.userId || "unknown";
   const timestamp = event.timestamp || Date.now();
+  const messageType = event.message.type;
+  const originalFilename = event.message.fileName || "";
 
-  console.log(`📥 รับสลิปจากกลุ่ม: ${messageId} (user: ${userId})`);
+  console.log(`📥 รับไฟล์จากกลุ่ม LINE: ${messageId} type=${messageType} user=${userId}`);
 
   try {
-    const imgRes = await axios.get(
-      `https://api-data.line.me/v2/bot/message/${messageId}/content`,
-      {
-        headers: { Authorization: `Bearer ${LINE_TOKEN}` },
-        responseType: "arraybuffer",
-        timeout: 30000,
-      }
-    );
-
-    const imgBuffer = Buffer.from(imgRes.data);
-    console.log(`  size: ${(imgBuffer.length / 1024).toFixed(1)} KB`);
+    const { buffer, contentType } = await downloadLineContent(messageId);
+    console.log(`  size: ${(buffer.length / 1024).toFixed(1)} KB content_type=${contentType || "-"}`);
 
     let savedFilename = null;
     try {
-      savedFilename = await uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId });
+      savedFilename = await uploadLineDocumentToFlask({
+        fileBuffer: buffer,
+        userId,
+        timestamp,
+        messageId,
+        messageType,
+        originalFilename,
+        contentType,
+      });
       console.log(`  ✓ บันทึกแล้ว: ${savedFilename}`);
     } catch (saveErr) {
-      console.error("  ⚠️ save-slip failed:", saveErr.response?.data || saveErr.message);
-      // เก็บเข้าคิว retry — เก็บแค่ messageId (ไม่เก็บ imgBuffer เพื่อประหยัด memory)
-      // ตอน retry จะดาวน์โหลดรูปจาก LINE ใหม่ (รูปอยู่บน LINE 14 วัน)
-      pendingSlips.set(messageId, {
-        userId, timestamp,
+      console.error("  ⚠️ save-line-document failed:", saveErr.response?.data || saveErr.message);
+      pendingLineDocuments.set(messageId, {
+        userId,
+        timestamp,
+        messageType,
+        originalFilename,
         addedAt: Date.now(),
         retries: 0,
       });
-      console.log(`  📋 เพิ่มเข้าคิว retry (รวม ${pendingSlips.size} รายการ)`);
+      console.log(`  📋 เพิ่มเข้าคิว retry (รวม ${pendingLineDocuments.size} รายการ)`);
     }
 
-    // ── ไม่ push per-slip แล้ว (ประหยัด LINE quota) ──
-    // ใช้ sendDailySummary() ตอน 18:00 รายงานรวบยอดแทน
+    // ไม่ push ต่อไฟล์ เพื่อประหยัด LINE quota; ใช้สรุปรายวันแทน
 
   } catch (err) {
-    console.error("handleSlipImage error:", err.message);
+    console.error("handleLineAttachment error:", err.message);
   }
 
   return true;
@@ -595,40 +620,63 @@ async function handleSlipImage(event) {
 //  Slip Upload Helper + Auto-Retry Queue
 // ─────────────────────────────────────────────
 
-// คิวสำหรับสลิปที่ save ไม่สำเร็จ (เช่น Flask down / ngrok down)
-// key = messageId, value = {userId, timestamp, addedAt, retries}
-const pendingSlips = new Map();
+// คิวสำหรับไฟล์ LINE ที่ save ไม่สำเร็จ (เช่น Flask down / ngrok down)
+// key = messageId, value = {userId, timestamp, messageType, originalFilename, addedAt, retries}
+const pendingLineDocuments = new Map();
 
 const RETRY_INTERVAL_MS  = 5 * 60 * 1000;  // retry ทุก 5 นาที
 const RETRY_MAX_AGE_HOURS = 12;             // ลบจากคิวถ้าค้างเกิน 12 ชั่วโมง (กัน leak)
 
 /**
- * อัพโหลดสลิปไป Flask
- * ถ้า imgBuffer ไม่มี (กรณี retry) จะดาวน์โหลดจาก LINE Content API ใหม่
+ * ดาวน์โหลด content จาก LINE Content API
  */
-async function uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId }) {
-  // ถ้าไม่มี buffer → ดาวน์โหลดจาก LINE ใหม่ (กรณี retry)
-  if (!imgBuffer) {
-    const imgRes = await axios.get(
-      `https://api-data.line.me/v2/bot/message/${messageId}/content`,
-      {
-        headers: { Authorization: `Bearer ${LINE_TOKEN}` },
-        responseType: "arraybuffer",
-        timeout: 30000,
-      }
-    );
-    imgBuffer = Buffer.from(imgRes.data);
+async function downloadLineContent(messageId) {
+  const res = await axios.get(
+    `https://api-data.line.me/v2/bot/message/${messageId}/content`,
+    {
+      headers: { Authorization: `Bearer ${LINE_TOKEN}` },
+      responseType: "arraybuffer",
+      timeout: 30000,
+      maxContentLength: LINE_DOC_MAX_BYTES,
+      maxBodyLength: LINE_DOC_MAX_BYTES,
+    }
+  );
+  return {
+    buffer: Buffer.from(res.data),
+    contentType: res.headers?.["content-type"] || "",
+  };
+}
+
+/**
+ * อัพโหลดไฟล์ดิบจาก LINE ไป Flask
+ */
+async function uploadLineDocumentToFlask({
+  fileBuffer,
+  userId,
+  timestamp,
+  messageId,
+  messageType,
+  originalFilename,
+  contentType,
+}) {
+  if (!fileBuffer) {
+    const downloaded = await downloadLineContent(messageId);
+    fileBuffer = downloaded.buffer;
+    contentType = contentType || downloaded.contentType;
   }
 
   const qs = new URLSearchParams({
     user_id:        userId || "RECOVERY",
     timestamp:      String(timestamp || Date.now()),
     message_id:     messageId,
+    message_type:   messageType || "file",
+    original_filename: originalFilename || "",
+    content_type:   contentType || "",
   }).toString();
 
   const saveRes = await axios.post(
-    `${PO_LOCAL_URL}/save-slip?${qs}`,
-    imgBuffer,
+    `${PO_LOCAL_URL}/save-line-document?${qs}`,
+    fileBuffer,
     {
       headers: {
         "X-PO-Secret": PO_SECRET,
@@ -636,7 +684,7 @@ async function uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId }) {
         "ngrok-skip-browser-warning": "true",
       },
       timeout: 30000,
-      maxBodyLength: 20 * 1024 * 1024,
+      maxBodyLength: LINE_DOC_MAX_BYTES,
     }
   );
 
@@ -647,29 +695,32 @@ async function uploadSlipToFlask({ imgBuffer, userId, timestamp, messageId }) {
  * ลองส่งสลิปในคิวอีกครั้ง — รันทุก 5 นาที
  */
 async function retryPendingSlips() {
-  if (pendingSlips.size === 0) return;
+  if (pendingLineDocuments.size === 0) return;
 
-  console.log(`🔄 retry pending slips: ${pendingSlips.size} รายการ`);
+  console.log(`🔄 retry pending LINE files: ${pendingLineDocuments.size} รายการ`);
 
   const cutoff = Date.now() - RETRY_MAX_AGE_HOURS * 60 * 60 * 1000;
 
-  for (const [messageId, info] of pendingSlips.entries()) {
+  for (const [messageId, info] of pendingLineDocuments.entries()) {
     // ลบรายการที่ค้างนานเกินไป (รูปบน LINE หมดอายุ 14 วัน แต่เกินบางขนาดก็เลิกลอง)
     if (info.addedAt < cutoff) {
       console.log(`  ⏰ ลบจากคิว (เก่าเกิน ${RETRY_MAX_AGE_HOURS}h): ${messageId}`);
-      pendingSlips.delete(messageId);
+      pendingLineDocuments.delete(messageId);
       continue;
     }
 
     try {
-      const filename = await uploadSlipToFlask({
-        imgBuffer: null,  // จะดาวน์โหลดใหม่
+      const filename = await uploadLineDocumentToFlask({
+        fileBuffer: null,  // จะดาวน์โหลดใหม่
         userId:    info.userId,
         timestamp: info.timestamp,
         messageId,
+        messageType: info.messageType,
+        originalFilename: info.originalFilename,
+        contentType: "",
       });
       console.log(`  ✓ retry สำเร็จ: ${filename} (${messageId})`);
-      pendingSlips.delete(messageId);
+      pendingLineDocuments.delete(messageId);
     } catch (err) {
       info.retries++;
       console.log(`  ✗ retry ครั้งที่ ${info.retries} ล้มเหลว: ${messageId} — ${err.message}`);
@@ -735,11 +786,11 @@ function flexText(text, options = {}) {
   };
 }
 
-function buildDailySummaryFlex(mailDocStat, slipStat, today, yesterday) {
+function buildDailySummaryFlex(mailDocStat, lineDocStat, today, yesterday) {
   const docsOk = !!mailDocStat.ok;
   const rows = docsOk && Array.isArray(mailDocStat.rows) ? mailDocStat.rows : [];
   const countText = docsOk ? `ดาวน์โหลดทั้งหมด ${mailDocStat.count} ไฟล์` : `ตรวจเอกสารไม่ได้ (${mailDocStat.error})`;
-  const slipText = slipStat.ok ? `สลิปโอนเงิน ${slipStat.count} รูป` : `สลิปโอนเงินตรวจไม่ได้`;
+  const lineDocText = lineDocStat.ok ? `LINE inbox ${lineDocStat.count} ไฟล์` : `LINE inbox ตรวจไม่ได้`;
 
   const bodyContents = [
     {
@@ -825,7 +876,7 @@ function buildDailySummaryFlex(mailDocStat, slipStat, today, yesterday) {
           color: "#0066CC",
           margin: "sm",
         }),
-        flexText(`${yesterday} 18:01 → ${today} 18:00 • ${slipText}`, {
+        flexText(`${yesterday} 18:01 → ${today} 18:00 • ${lineDocText}`, {
           size: "xxs",
           color: "#888888",
           margin: "xs",
@@ -849,15 +900,15 @@ async function sendDailySummary() {
   const yesterday = getYesterdayBkk(today);
 
   try {
-    const [slipStat, mailDocStat] = await Promise.all([
-      fetchDailyStat("slip-stats", today),
+    const [lineDocStat, mailDocStat] = await Promise.all([
+      fetchDailyStat("line-inbox-stats", today),
       fetchDailyStat("mail-doc-stats", today),
     ]);
 
-    if (!slipStat.ok && !mailDocStat.ok) {
+    if (!lineDocStat.ok && !mailDocStat.ok) {
       console.error(
         `Daily summary skipped (period_end ${today}): ` +
-        `mail_docs=${mailDocStat.error || "ERR"} slips=${slipStat.error || "ERR"}`
+        `mail_docs=${mailDocStat.error || "ERR"} line_inbox=${lineDocStat.error || "ERR"}`
       );
       return;
     }
@@ -865,12 +916,12 @@ async function sendDailySummary() {
     await linePushFlex(
       SLIP_GROUP_ID,
       `สรุปดาวน์โหลด ${mailDocStat.ok ? mailDocStat.count : 0} ไฟล์ ประจำวันที่ ${formatThaiDate(today)}`,
-      buildDailySummaryFlex(mailDocStat, slipStat, today, yesterday)
+      buildDailySummaryFlex(mailDocStat, lineDocStat, today, yesterday)
     );
     console.log(
       `✓ ส่งสรุปรายวัน (period_end ${today}): ` +
       `mail_docs=${mailDocStat.ok ? mailDocStat.count : "ERR"} ` +
-      `slips=${slipStat.ok ? slipStat.count : "ERR"}`
+      `line_inbox=${lineDocStat.ok ? lineDocStat.count : "ERR"}`
     );
   } catch (err) {
     console.error("Daily summary error:", err.message);
@@ -929,8 +980,16 @@ app.post("/webhook", async (req, res) => {
 
   res.sendStatus(200);
 
-  if (event.message.type === "image") {
-    await handleSlipImage(event).catch(e => console.error("SlipImage error:", e.message));
+  if (await isFromThisBot(event).catch((e) => {
+    console.warn("[LINE] self-message guard failed:", e.message);
+    return false;
+  })) {
+    console.log(`[LINE] ignored self-sent bot message: ${msgId}`);
+    return;
+  }
+
+  if (DOWNLOADABLE_LINE_TYPES.has(event.message.type)) {
+    await handleLineAttachment(event).catch(e => console.error("LineAttachment error:", e.message));
     return;
   }
 
@@ -1221,9 +1280,9 @@ app.listen(PORT, () => {
     console.log("Self-ping to stay awake");
   }, 14 * 60 * 1000);
 
-  // Auto-retry สลิปที่ค้างในคิว ทุก 5 นาที
+  // Auto-retry ไฟล์ LINE ที่ค้างในคิว ทุก 5 นาที
   setInterval(retryPendingSlips, RETRY_INTERVAL_MS);
-  console.log(`🔁 ตั้ง auto-retry pending slips ทุก ${RETRY_INTERVAL_MS / 60000} นาที`);
+  console.log(`🔁 ตั้ง auto-retry pending LINE files ทุก ${RETRY_INTERVAL_MS / 60000} นาที`);
 
   // ยิงสรุปเอกสารจากเมล + สลิปประจำวัน 18:00 BKK (ครอบ 18:01 เมื่อวาน → 18:00 วันนี้)
   scheduleDailySummary();
