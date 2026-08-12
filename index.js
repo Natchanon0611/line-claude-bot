@@ -22,11 +22,23 @@ if (!PO_SECRET) {
 
 // ─── SLIP COLLECTOR — กลุ่ม LINE ที่จะดึงสลิปโอนเงินมาเก็บ ───
 const SLIP_GROUP_ID = process.env.SLIP_GROUP_ID || "";
+const AMPOHM_GROUP_ID = process.env.AMPOHM_GROUP_ID || process.env.APPOM_GROUP_ID || "Cc4af6846c391128bb8500b4f2c1e7860";
 const DOWNLOADABLE_LINE_TYPES = new Set(["image", "file", "video", "audio"]);
 const LINE_DOC_MAX_BYTES = Number(process.env.LINE_DOC_MAX_BYTES || 50 * 1024 * 1024);
 
 function isLineGroupId(id) {
   return typeof id === "string" && id.startsWith("C");
+}
+
+function getLineAttachmentGroups() {
+  return [
+    { company: "fes", label: "FES", groupId: SLIP_GROUP_ID, includeMailDocs: true },
+    { company: "ampohm", label: "AmpOhm", groupId: AMPOHM_GROUP_ID, includeMailDocs: false },
+  ].filter((group) => isLineGroupId(group.groupId));
+}
+
+function getLineAttachmentGroup(groupId) {
+  return getLineAttachmentGroups().find((group) => group.groupId === groupId) || null;
 }
 
 // Push เฉพาะ target ที่ตั้งค่าไว้เท่านั้น ไม่จำแชตล่าสุดเป็น fallback
@@ -568,13 +580,15 @@ async function handlePOPrint(event) {
 // ─────────────────────────────────────────────
 async function handleLineAttachment(event) {
   if (event.type !== "message" || !DOWNLOADABLE_LINE_TYPES.has(event.message?.type)) return false;
-  if (!SLIP_GROUP_ID || event.source?.groupId !== SLIP_GROUP_ID) return false;
+  const lineGroup = getLineAttachmentGroup(event.source?.groupId);
+  if (!lineGroup) return false;
 
   const messageId = event.message.id;
   const userId    = event.source.userId || "unknown";
   const timestamp = event.timestamp || Date.now();
   const messageType = event.message.type;
   const originalFilename = event.message.fileName || "";
+  console.log(`[LINE-INBOX] company=${lineGroup.company} message=${messageId} type=${messageType} user=${userId}`);
 
   console.log(`📥 รับไฟล์จากกลุ่ม LINE: ${messageId} type=${messageType} user=${userId}`);
 
@@ -592,6 +606,8 @@ async function handleLineAttachment(event) {
         messageType,
         originalFilename,
         contentType,
+        company: lineGroup.company,
+        groupId: lineGroup.groupId,
       });
       console.log(`  ✓ บันทึกแล้ว: ${savedFilename}`);
     } catch (saveErr) {
@@ -601,6 +617,8 @@ async function handleLineAttachment(event) {
         timestamp,
         messageType,
         originalFilename,
+        company: lineGroup.company,
+        groupId: lineGroup.groupId,
         addedAt: Date.now(),
         retries: 0,
       });
@@ -658,6 +676,8 @@ async function uploadLineDocumentToFlask({
   messageType,
   originalFilename,
   contentType,
+  company,
+  groupId,
 }) {
   if (!fileBuffer) {
     const downloaded = await downloadLineContent(messageId);
@@ -672,6 +692,8 @@ async function uploadLineDocumentToFlask({
     message_type:   messageType || "file",
     original_filename: originalFilename || "",
     content_type:   contentType || "",
+    company:        company || "",
+    group_id:       groupId || "",
   }).toString();
 
   const saveRes = await axios.post(
@@ -717,6 +739,8 @@ async function retryPendingSlips() {
         messageId,
         messageType: info.messageType,
         originalFilename: info.originalFilename,
+        company: info.company,
+        groupId: info.groupId,
         contentType: "",
       });
       console.log(`  ✓ retry สำเร็จ: ${filename} (${messageId})`);
@@ -745,10 +769,13 @@ function getYesterdayBkk(todayYmd) {
   return `${yy}-${mm}-${dd}`;
 }
 
-async function fetchDailyStat(endpoint, today) {
+async function fetchDailyStat(endpoint, today, lineGroup = null) {
   try {
+    const qs = new URLSearchParams({ period_end_date: today });
+    if (lineGroup?.company) qs.set("company", lineGroup.company);
+    if (lineGroup?.groupId) qs.set("group_id", lineGroup.groupId);
     const res = await axios.get(
-      `${PO_LOCAL_URL}/${endpoint}?period_end_date=${today}`,
+      `${PO_LOCAL_URL}/${endpoint}?${qs.toString()}`,
       {
         headers: { "X-PO-Secret": PO_SECRET, "ngrok-skip-browser-warning": "true" },
         timeout: 15000,
@@ -893,28 +920,36 @@ function buildDailySummaryFlex(mailDocStat, lineDocStat, today, yesterday) {
 }
 
 async function sendDailySummary() {
-  if (!SLIP_GROUP_ID) return;
+  const lineGroups = getLineAttachmentGroups();
+  if (lineGroups.length === 0) return;
 
   // วันที่วันนี้ตามเวลา BKK (สำหรับ period_end_date)
   const today = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Bangkok" });
   const yesterday = getYesterdayBkk(today);
 
+  for (const lineGroup of lineGroups) {
   try {
-    const [lineDocStat, mailDocStat] = await Promise.all([
-      fetchDailyStat("line-inbox-stats", today),
-      fetchDailyStat("mail-doc-stats", today),
+    let [lineDocStat, mailDocStat] = await Promise.all([
+      fetchDailyStat("line-inbox-stats", today, lineGroup),
+      lineGroup.includeMailDocs ? fetchDailyStat("mail-doc-stats", today, lineGroup) : Promise.resolve({ ok: true, count: 0, rows: [] }),
     ]);
+    if (!lineGroup.includeMailDocs && lineDocStat.ok) {
+      mailDocStat = {
+        ...lineDocStat,
+        rows: (lineDocStat.rows || []).map((row) => ({ entity: lineGroup.label, ...row })),
+      };
+    }
 
     if (!lineDocStat.ok && !mailDocStat.ok) {
       console.error(
         `Daily summary skipped (period_end ${today}): ` +
         `mail_docs=${mailDocStat.error || "ERR"} line_inbox=${lineDocStat.error || "ERR"}`
       );
-      return;
+      continue;
     }
 
     await linePushFlex(
-      SLIP_GROUP_ID,
+      lineGroup.groupId,
       `สรุปดาวน์โหลด ${mailDocStat.ok ? mailDocStat.count : 0} ไฟล์ ประจำวันที่ ${formatThaiDate(today)}`,
       buildDailySummaryFlex(mailDocStat, lineDocStat, today, yesterday)
     );
@@ -924,7 +959,8 @@ async function sendDailySummary() {
       `line_inbox=${lineDocStat.ok ? lineDocStat.count : "ERR"}`
     );
   } catch (err) {
-    console.error("Daily summary error:", err.message);
+    console.error(`Daily summary error company=${lineGroup.company}:`, err.message);
+  }
   }
 }
 
@@ -1004,7 +1040,7 @@ app.post("/webhook", async (req, res) => {
   }
 
   // กลุ่มรับสลิป: บอทไม่ตอบข้อความผู้ใช้ — เก็บสลิป + สรุปรายวันอย่างเดียว
-  if (SLIP_GROUP_ID && event.source?.groupId === SLIP_GROUP_ID) return;
+  if (getLineAttachmentGroup(event.source?.groupId)) return;
 
   const confirmed = await handleConfirmCancel(event);
   if (confirmed) return;
