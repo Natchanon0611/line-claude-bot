@@ -25,6 +25,7 @@ const SLIP_GROUP_ID = process.env.SLIP_GROUP_ID || "";
 const AMPOHM_GROUP_ID = process.env.AMPOHM_GROUP_ID || process.env.APPOM_GROUP_ID || "Cc4af6846c391128bb8500b4f2c1e7860";
 const DOWNLOADABLE_LINE_TYPES = new Set(["image", "file", "video", "audio"]);
 const LINE_DOC_MAX_BYTES = Number(process.env.LINE_DOC_MAX_BYTES || 50 * 1024 * 1024);
+const DAILY_SUMMARY_SEND_EMPTY = String(process.env.DAILY_SUMMARY_SEND_EMPTY || "").toLowerCase() === "true";
 
 function isLineGroupId(id) {
   return typeof id === "string" && id.startsWith("C");
@@ -919,6 +920,12 @@ function buildDailySummaryFlex(mailDocStat, lineDocStat, today, yesterday) {
   };
 }
 
+function dailySummaryTotalCount(mailDocStat, lineDocStat) {
+  const mailCount = mailDocStat.ok ? Number(mailDocStat.count || 0) : 0;
+  const lineCount = lineDocStat.ok ? Number(lineDocStat.count || 0) : 0;
+  return mailCount + lineCount;
+}
+
 async function sendDailySummary() {
   const lineGroups = getLineAttachmentGroups();
   if (lineGroups.length === 0) return;
@@ -948,9 +955,15 @@ async function sendDailySummary() {
       continue;
     }
 
+    const totalCount = dailySummaryTotalCount(mailDocStat, lineDocStat);
+    if (!DAILY_SUMMARY_SEND_EMPTY && totalCount === 0) {
+      console.log(`Daily summary skipped company=${lineGroup.company} (period_end ${today}): no loaded documents`);
+      continue;
+    }
+
     await linePushFlex(
       lineGroup.groupId,
-      `สรุปดาวน์โหลด ${mailDocStat.ok ? mailDocStat.count : 0} ไฟล์ ประจำวันที่ ${formatThaiDate(today)}`,
+      `สรุปดาวน์โหลด ${totalCount} ไฟล์ ประจำวันที่ ${formatThaiDate(today)}`,
       buildDailySummaryFlex(mailDocStat, lineDocStat, today, yesterday)
     );
     console.log(
