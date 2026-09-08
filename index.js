@@ -2,6 +2,7 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const { processWebhookBatch } = require("./webhook_batch");
 const app = express();
 
 app.use(express.json({ limit: "20mb" }));
@@ -1004,30 +1005,21 @@ app.get("/webhook", (req, res) => res.send("Webhook endpoint is alive"));
 
 const processedMsgIds = new Set();
 
-app.post("/webhook", async (req, res) => {
-  const events = req.body.events || [];
-  const event  = events[0];
-
-  console.log("EVENT =", JSON.stringify(req.body));
-
-  if (!event || event.type !== "message") {
-    return res.sendStatus(200);
-  }
+async function processWebhookEvent(event) {
+  if (!event || event.type !== "message") return;
 
   if (!isLineGroupId(event.source?.groupId)) {
     console.log(`[LINE] ignored non-group message from source=${event.source?.userId || event.source?.roomId || "unknown"}`);
-    return res.sendStatus(200);
+    return;
   }
 
   const msgId = event.message.id;
   if (processedMsgIds.has(msgId)) {
     console.log(`Duplicate message ignored: ${msgId}`);
-    return res.sendStatus(200);
+    return;
   }
   processedMsgIds.add(msgId);
   setTimeout(() => processedMsgIds.delete(msgId), 5 * 60 * 1000);
-
-  res.sendStatus(200);
 
   if (await isFromThisBot(event).catch((e) => {
     console.warn("[LINE] self-message guard failed:", e.message);
@@ -1089,6 +1081,19 @@ app.post("/webhook", async (req, res) => {
   } catch (error) {
     console.error("Claude ERROR =", error.response?.data || error.message);
   }
+}
+
+async function processWebhookEvents(events, eventHandler = processWebhookEvent) {
+  return processWebhookBatch(events, eventHandler, console);
+}
+
+app.post("/webhook", (req, res) => {
+  const events = req.body?.events || [];
+  console.log("EVENT =", JSON.stringify(req.body));
+
+  // LINE expects a quick acknowledgement; process every event in the batch afterwards.
+  res.sendStatus(200);
+  void processWebhookEvents(events);
 });
 
 app.post("/notify-new-po", async (req, res) => {
@@ -1320,19 +1325,27 @@ app.get("/po-image/:id", (req, res) => {
 //  Start server
 // ─────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server running on port " + PORT);
+function startServer() {
+  return app.listen(PORT, () => {
+    console.log("Server running on port " + PORT);
 
-  // Self-ping ทุก 14 นาที กัน Render free tier นอนหลับ
-  setInterval(() => {
-    axios.get(`${RENDER_URL}/`).catch(() => {});
-    console.log("Self-ping to stay awake");
-  }, 14 * 60 * 1000);
+    // Self-ping ทุก 14 นาที กัน Render free tier นอนหลับ
+    setInterval(() => {
+      axios.get(`${RENDER_URL}/`).catch(() => {});
+      console.log("Self-ping to stay awake");
+    }, 14 * 60 * 1000);
 
-  // Auto-retry ไฟล์ LINE ที่ค้างในคิว ทุก 5 นาที
-  setInterval(retryPendingSlips, RETRY_INTERVAL_MS);
-  console.log(`🔁 ตั้ง auto-retry pending LINE files ทุก ${RETRY_INTERVAL_MS / 60000} นาที`);
+    // Auto-retry ไฟล์ LINE ที่ค้างในคิว ทุก 5 นาที
+    setInterval(retryPendingSlips, RETRY_INTERVAL_MS);
+    console.log(`🔁 ตั้ง auto-retry pending LINE files ทุก ${RETRY_INTERVAL_MS / 60000} นาที`);
 
-  // ยิงสรุปเอกสารจากเมล + สลิปประจำวัน 18:00 BKK (ครอบ 18:01 เมื่อวาน → 18:00 วันนี้)
-  scheduleDailySummary();
-});
+    // ยิงสรุปเอกสารจากเมล + สลิปประจำวัน 18:00 BKK (ครอบ 18:01 เมื่อวาน → 18:00 วันนี้)
+    scheduleDailySummary();
+  });
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = { app, processWebhookEvent, processWebhookEvents, startServer };
