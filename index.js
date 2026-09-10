@@ -53,24 +53,65 @@ function getNotifyTarget() {
   return groupTarget || null;
 }
 
-// เก็บรูปชั่วคราว (หมดอายุใน 1 ชั่วโมง)
+// เก็บรูป PO สำหรับให้ LINE ดึงผ่าน public URL
 const imageStore = new Map();
 const IMAGE_CACHE_DIR = process.env.PO_IMAGE_CACHE_DIR || path.join(__dirname, "logs", "po_images");
+const DEFAULT_IMAGE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_TIMEOUT_MS = 2_147_483_647;
+const configuredImageCacheTtl = Number(process.env.PO_IMAGE_CACHE_TTL_MS || DEFAULT_IMAGE_CACHE_TTL_MS);
+const IMAGE_CACHE_TTL_MS = Number.isFinite(configuredImageCacheTtl) ? configuredImageCacheTtl : DEFAULT_IMAGE_CACHE_TTL_MS;
+const IMAGE_CACHE_MAX_AGE_SECONDS = Math.max(3600, Math.floor(IMAGE_CACHE_TTL_MS / 1000));
+const PUBLIC_RENDER_URL = String(RENDER_URL).replace(/\/+$/, "");
 
-function storePoImage(imageB64) {
+function writeImageCacheFile(id, kind, imageB64) {
+  if (!imageB64) return;
+  fs.mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
+  fs.writeFileSync(path.join(IMAGE_CACHE_DIR, `${id}.${kind}.jpg`), Buffer.from(imageB64, "base64"));
+}
+
+function readImageCacheFile(id, kind) {
+  const cachedPath = path.join(IMAGE_CACHE_DIR, `${id}.${kind}.jpg`);
+  return fs.existsSync(cachedPath) ? fs.readFileSync(cachedPath) : null;
+}
+
+function removeImageCacheFiles(id) {
+  fs.rm(path.join(IMAGE_CACHE_DIR, `${id}.original.jpg`), { force: true }, () => {});
+  fs.rm(path.join(IMAGE_CACHE_DIR, `${id}.preview.jpg`), { force: true }, () => {});
+  fs.rm(path.join(IMAGE_CACHE_DIR, `${id}.jpg`), { force: true }, () => {});
+}
+
+function scheduleImageCacheRemoval(id, remainingMs = IMAGE_CACHE_TTL_MS) {
+  if (remainingMs <= 0) return;
+  const delayMs = Math.min(remainingMs, MAX_TIMEOUT_MS);
+  setTimeout(() => {
+    const nextRemainingMs = remainingMs - delayMs;
+    if (nextRemainingMs > 0) {
+      scheduleImageCacheRemoval(id, nextRemainingMs);
+      return;
+    }
+    imageStore.delete(id);
+    removeImageCacheFiles(id);
+  }, delayMs);
+}
+
+function storePoImage(imageB64, previewB64 = "") {
   const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-  imageStore.set(id, imageB64);
+  imageStore.set(id, { original: imageB64, preview: previewB64 || imageB64 });
   try {
-    fs.mkdirSync(IMAGE_CACHE_DIR, { recursive: true });
-    fs.writeFileSync(path.join(IMAGE_CACHE_DIR, `${id}.jpg`), Buffer.from(imageB64, "base64"));
+    writeImageCacheFile(id, "original", imageB64);
+    writeImageCacheFile(id, "preview", previewB64 || imageB64);
   } catch (err) {
     console.warn(`[PO-IMAGE] disk cache write failed: ${err.message}`);
   }
-  setTimeout(() => {
-    imageStore.delete(id);
-    fs.rm(path.join(IMAGE_CACHE_DIR, `${id}.jpg`), { force: true }, () => {});
-  }, 60 * 60 * 1000);
+  scheduleImageCacheRemoval(id);
   return id;
+}
+
+function poImageUrls(id) {
+  return {
+    original: `${PUBLIC_RENDER_URL}/po-image/${id}`,
+    preview: `${PUBLIC_RENDER_URL}/po-image/${id}/preview`,
+  };
 }
 
 // เก็บ PO ที่รอยืนยันลายเซ็น
@@ -121,7 +162,7 @@ async function linePush(to, text) {
   );
 }
 
-async function linePushImage(to, imageUrl) {
+async function linePushImage(to, imageUrl, previewImageUrl = imageUrl) {
   if (!isLineGroupId(to)) {
     console.warn(`[LINE] blocked image push to non-group target: ${to || "EMPTY"}`);
     return { skipped: true, reason: "non_group_target" };
@@ -133,11 +174,18 @@ async function linePushImage(to, imageUrl) {
       messages: [{
         type: "image",
         originalContentUrl: imageUrl,
-        previewImageUrl: imageUrl
+        previewImageUrl
       }]
     },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
   );
+}
+
+async function linePushPoImage(to, item) {
+  if (!item?.image_b64) return;
+  const id = storePoImage(item.image_b64, item.preview_b64);
+  const urls = poImageUrls(id);
+  await linePushImage(to, urls.original, urls.preview);
 }
 
 async function linePushFlex(to, altText, contents) {
@@ -233,8 +281,7 @@ async function processPOSignResult(data, senderName, notifyId) {
         `ตรวจสอบรูปด้านล่าง แล้วตอบ:\n✅ "ยืนยัน" — ส่งเมล + ปริ้น\n❌ "ยกเลิก" — ลบและส่ง PO ใหม่`
       );
       if (item.image_b64) {
-        const id = storePoImage(item.image_b64);
-        try { await linePushImage(notifyId, `${RENDER_URL}/po-image/${id}`); }
+        try { await linePushPoImage(notifyId, item); }
         catch (e) { console.error("[SEND] linePushImage failed:", e.response?.status, e.message); }
       }
       continue;
@@ -272,8 +319,7 @@ async function processPOSignResult(data, senderName, notifyId) {
     );
 
     if (item.image_b64) {
-      const id = storePoImage(item.image_b64);
-      try { await linePushImage(notifyId, `${RENDER_URL}/po-image/${id}`); }
+      try { await linePushPoImage(notifyId, item); }
       catch (e) { console.error("[SEND] linePushImage failed:", e.response?.status, e.message); }
     }
   }
@@ -1114,10 +1160,10 @@ app.post("/notify-new-po", async (req, res) => {
         console.error(`[NOTIFY] text push FAILED: ${e.response?.status} ${e.message}`);
       }
       if (image_b64) {
-        const id = storePoImage(image_b64);
-        const imageUrl = `${RENDER_URL}/po-image/${id}`;
+        const id = storePoImage(image_b64, req.body.preview_b64);
+        const imageUrl = poImageUrls(id);
         try {
-          await linePushImage(target, imageUrl);
+          await linePushImage(target, imageUrl.original, imageUrl.preview);
           console.log(`[NOTIFY] image push OK`);
         } catch (e) {
           console.error(`[NOTIFY] image push FAILED: ${e.response?.status} ${e.message}`);
@@ -1167,13 +1213,13 @@ app.post("/auto-sign-po", async (req, res) => {
       console.error(`[AUTO-SIGN] push FAILED: ${e.response?.status} ${e.message}`);
     }
   };
-  const bsendImage = async (imageUrl) => {
+  const bsendImage = async (imageUrl, previewImageUrl = imageUrl) => {
     if (!notifyTarget) {
       console.warn("[AUTO-SIGN] no notify target for image - set LINE_NOTIFY_TARGET or SLIP_GROUP_ID to a groupId");
       return;
     }
     try {
-      await linePushImage(notifyTarget, imageUrl);
+      await linePushImage(notifyTarget, imageUrl, previewImageUrl);
       console.log(`[AUTO-SIGN] push image OK to ${notifyTarget}`);
     } catch (e) {
       console.error(`[AUTO-SIGN] push image FAILED: ${e.response?.status} ${e.message}`);
@@ -1260,8 +1306,9 @@ app.post("/auto-sign-po", async (req, res) => {
       );
 
       if (item.image_b64) {
-        const id = storePoImage(item.image_b64);
-        await bsendImage(`${RENDER_URL}/po-image/${id}`);
+        const id = storePoImage(item.image_b64, item.preview_b64);
+        const urls = poImageUrls(id);
+        await bsendImage(urls.original, urls.preview);
       }
     }
 
@@ -1306,19 +1353,30 @@ app.post("/po-mail-result", async (req, res) => {
   }
 });
 
-app.get("/po-image/:id", (req, res) => {
-  let data = imageStore.get(req.params.id);
-  let buf = data ? Buffer.from(data, "base64") : null;
+function sendCachedPoImage(req, res, kind) {
+  const id = req.params.id;
+  const entry = imageStore.get(id);
+  const imageB64 = entry && (entry[kind] || entry.original || entry);
+  let buf = imageB64 ? Buffer.from(imageB64, "base64") : null;
   if (!buf) {
-    const cachedPath = path.join(IMAGE_CACHE_DIR, `${req.params.id}.jpg`);
-    if (fs.existsSync(cachedPath)) {
-      buf = fs.readFileSync(cachedPath);
-    }
+    buf = readImageCacheFile(id, kind) ||
+          readImageCacheFile(id, "original") ||
+          (kind === "original" ? readImageCacheFile(id, "preview") : null);
   }
   if (!buf) return res.status(404).send("Not found or expired");
   res.set("Content-Type", "image/jpeg");
-  res.set("Cache-Control", "public, max-age=3600");
+  res.set("Cache-Control", `public, max-age=${IMAGE_CACHE_MAX_AGE_SECONDS}, immutable`);
+  res.set("Content-Length", String(buf.length));
+  res.set("X-Content-Type-Options", "nosniff");
   res.send(buf);
+}
+
+app.get("/po-image/:id/preview", (req, res) => {
+  sendCachedPoImage(req, res, "preview");
+});
+
+app.get("/po-image/:id", (req, res) => {
+  sendCachedPoImage(req, res, "original");
 });
 
 // ─────────────────────────────────────────────
