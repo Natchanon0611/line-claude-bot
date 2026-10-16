@@ -3,6 +3,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const { processWebhookBatch } = require("./webhook_batch");
+const { createCreditDecorator } = require("./notification_credit");
 const app = express();
 
 app.use(express.json({ limit: "20mb" }));
@@ -15,6 +16,9 @@ const PO_LOCAL_URL = process.env.PO_LOCAL_URL || "https://yearling-harvest-abrea
 const PO_SECRET   = process.env.PO_SECRET;
 const RENDER_URL  = process.env.RENDER_URL || "https://line-claude-bot-y1jo.onrender.com";
 let cachedBotUserId = process.env.LINE_BOT_USER_ID || "";
+const notificationCredit = createCreditDecorator({
+  http: axios, lineToken: LINE_TOKEN, localUrl: PO_LOCAL_URL, secret: PO_SECRET,
+});
 
 if (!PO_SECRET) {
   console.error("ERROR: PO_SECRET environment variable is required.");
@@ -143,21 +147,23 @@ function isPOFileName(filename = "") {
 //  LINE Helpers
 // ─────────────────────────────────────────────
 async function lineReply(replyToken, text) {
+  const decorated = await notificationCredit.text(text);
   await axios.post(
     "https://api.line.me/v2/bot/message/reply",
-    { replyToken, messages: [{ type: "text", text: String(text).substring(0, 2000) }] },
+    { replyToken, messages: [{ type: "text", text: decorated }] },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
   );
 }
 
-async function linePush(to, text) {
+async function linePush(to, text, credit) {
   if (!isLineGroupId(to)) {
     console.warn(`[LINE] blocked push to non-group target: ${to || "EMPTY"}`);
     return { skipped: true, reason: "non_group_target" };
   }
+  const decorated = await notificationCredit.text(text, credit);
   await axios.post(
     "https://api.line.me/v2/bot/message/push",
-    { to, messages: [{ type: "text", text: String(text).substring(0, 2000) }] },
+    { to, messages: [{ type: "text", text: decorated }] },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
   );
 }
@@ -200,7 +206,7 @@ async function linePushFlex(to, altText, contents) {
       messages: [{
         type: "flex",
         altText: String(altText || "สรุปรายวัน").substring(0, 400),
-        contents,
+        contents: await notificationCredit.flex(contents),
       }],
     },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
@@ -242,8 +248,8 @@ async function lineBroadcastImage(imageUrl) {
 //  Process Sign Result (shared logic)
 // ─────────────────────────────────────────────
 async function processPOSignResult(data, senderName, notifyId) {
-  const send = async (text) => {
-    try { await linePush(notifyId, text); } catch (e) {
+  const send = async (text, credit = data.credit) => {
+    try { await linePush(notifyId, text, credit); } catch (e) {
       console.error("[SEND] linePush failed:", e.response?.status, e.message);
     }
   };
@@ -278,7 +284,8 @@ async function processPOSignResult(data, senderName, notifyId) {
       await send(
         `⚠️ Claude หาตำแหน่งลายเซ็นไม่เจอ\n━━━━━━━━━━━━━━━\n` +
         `📄 PO: ${item.po_id}\n👤 สั่งโดย: ${senderName}\n━━━━━━━━━━━━━━━\n` +
-        `ตรวจสอบรูปด้านล่าง แล้วตอบ:\n✅ "ยืนยัน" — ส่งเมล + ปริ้น\n❌ "ยกเลิก" — ลบและส่ง PO ใหม่`
+        `ตรวจสอบรูปด้านล่าง แล้วตอบ:\n✅ "ยืนยัน" — ส่งเมล + ปริ้น\n❌ "ยกเลิก" — ลบและส่ง PO ใหม่`,
+        item.credit
       );
       if (item.image_b64) {
         try { await linePushPoImage(notifyId, item); }
@@ -315,7 +322,8 @@ async function processPOSignResult(data, senderName, notifyId) {
       modeLine +
       `📄 PO: ${item.po_id}\n` + quotationLine + factoryLine + quotationMoveLine + fileLine + waitingLine +
       `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
-      nasLine + printLine + `━━━━━━━━━━━━━━━`
+      nasLine + printLine + `━━━━━━━━━━━━━━━`,
+      item.credit
     );
 
     if (item.image_b64) {
@@ -331,7 +339,8 @@ async function processPOSignResult(data, senderName, notifyId) {
       modeLine +
       `📄 ไฟล์: ${item.file}\n⚠️ สาเหตุ: ${item.error}\n` +
       manualLine +
-      `━━━━━━━━━━━━━━━`
+      `━━━━━━━━━━━━━━━`,
+      item.credit
     );
   }
 }
@@ -1105,28 +1114,10 @@ async function processWebhookEvent(event) {
   const printed = await handlePOPrint(event);
   if (printed) return;
 
-  try {
-    const claude = await axios.post(
-      "https://api.anthropic.com/v1/messages",
-      {
-        model: "claude-haiku-4-5",
-        max_tokens: 300,
-        messages: [{ role: "user", content: event.message.text }]
-      },
-      {
-        headers: {
-          "x-api-key": process.env.CLAUDE_API_KEY,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json"
-        }
-      }
-    );
-    const reply = claude.data.content[0].text || "No response";
-    const replyTarget = event.source.groupId || event.source.userId;
-    await linePush(replyTarget, reply.substring(0, 1000));
-  } catch (error) {
-    console.error("Claude ERROR =", error.response?.data || error.message);
-  }
+  // Generic free-text AI replies are intentionally disabled.
+  // Unknown text is ignored only after every supported LINE command handler runs.
+  console.log(`[LINE] ignored unhandled text message: ${msgId}`);
+  return;
 }
 
 async function processWebhookEvents(events, eventHandler = processWebhookEvent) {
@@ -1201,13 +1192,13 @@ app.post("/auto-sign-po", async (req, res) => {
   // [TARGET MODE] Send only to configured LINE_NOTIFY_TARGET/SLIP_GROUP_ID.
   const notifyTarget = getNotifyTarget();
 
-  const bsend = async (text) => {
+  const bsend = async (text, credit) => {
     if (!notifyTarget) {
       console.warn("[AUTO-SIGN] no notify target - set LINE_NOTIFY_TARGET or SLIP_GROUP_ID to a groupId");
       return;
     }
     try {
-      await linePush(notifyTarget, text);
+      await linePush(notifyTarget, text, credit);
       console.log(`[AUTO-SIGN] push OK to ${notifyTarget} (${String(text).substring(0,30)}...)`);
     } catch (e) {
       console.error(`[AUTO-SIGN] push FAILED: ${e.response?.status} ${e.message}`);
@@ -1302,7 +1293,8 @@ app.post("/auto-sign-po", async (req, res) => {
         `✅ เซ็น PO เสร็จแล้ว\n━━━━━━━━━━━━━━━\n` +
         `📄 PO: ${item.po_id}\n` + quotationLine + factoryLine + quotationMoveLine + fileLine + waitingLine +
         `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
-        nasLine + printLine + `━━━━━━━━━━━━━━━`
+        nasLine + printLine + `━━━━━━━━━━━━━━━`,
+        item.credit
       );
 
       if (item.image_b64) {
@@ -1315,7 +1307,8 @@ app.post("/auto-sign-po", async (req, res) => {
     for (const item of (data.failed || [])) {
       await bsend(
         `❌ เซ็น PO ไม่สำเร็จ\n━━━━━━━━━━━━━━━\n` +
-        `📄 ไฟล์: ${item.file}\n⚠️ สาเหตุ: ${item.error}\n━━━━━━━━━━━━━━━`
+        `📄 ไฟล์: ${item.file}\n⚠️ สาเหตุ: ${item.error}\n━━━━━━━━━━━━━━━`,
+        item.credit
       );
     }
   } catch (err) {
@@ -1326,8 +1319,14 @@ app.post("/auto-sign-po", async (req, res) => {
   }
 });
 
+// Authenticated read-only verification; checking credits never pushes LINE.
+app.get("/notification-credit-status", async (req, res) => {
+  if (req.headers["x-po-secret"] !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
+  return res.json(await notificationCredit.snapshot());
+});
+
 app.post("/po-mail-result", async (req, res) => {
-  const { secret, text } = req.body || {};
+  const { secret, text, credit } = req.body || {};
   if (secret !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
 
   const notifyTarget = getNotifyTarget();
@@ -1337,7 +1336,7 @@ app.post("/po-mail-result", async (req, res) => {
   }
 
   try {
-    await linePush(notifyTarget, String(text || "สรุปส่งเมล PO ว่าง").substring(0, 2000));
+    await linePush(notifyTarget, String(text || "สรุปส่งเมล PO ว่าง").substring(0, 2000), credit);
     console.log("[PO-MAIL] result pushed");
     return res.json({ status: "ok" });
   } catch (err) {
