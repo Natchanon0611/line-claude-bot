@@ -4,14 +4,15 @@ const fs = require("fs");
 const path = require("path");
 const { processWebhookBatch } = require("./webhook_batch");
 const { createCreditDecorator } = require("./notification_credit");
+const { registerLineWebhook } = require("./line_webhook");
 const app = express();
 
-app.use(express.json({ limit: "20mb" }));
 
 // ─────────────────────────────────────────────
 //  CONFIG (ตั้งใน Render Environment Variables)
 // ─────────────────────────────────────────────
 const LINE_TOKEN  = process.env.LINE_TOKEN;
+const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const PO_LOCAL_URL = process.env.PO_LOCAL_URL || "https://yearling-harvest-abreast.ngrok-free.dev";
 const PO_SECRET   = process.env.PO_SECRET;
 const RENDER_URL  = process.env.RENDER_URL || "https://line-claude-bot-y1jo.onrender.com";
@@ -24,6 +25,10 @@ if (!PO_SECRET) {
   console.error("ERROR: PO_SECRET environment variable is required.");
   process.exit(1);
 }
+
+// Verify LINE before parsing JSON; other PO callbacks keep their existing secret checks.
+registerLineWebhook(app, { express, channelSecret: LINE_CHANNEL_SECRET, processEvents: processWebhookEvents });
+app.use(express.json({ limit: "20mb" }));
 
 // ─── SLIP COLLECTOR — กลุ่ม LINE ที่จะดึงสลิปโอนเงินมาเก็บ ───
 const SLIP_GROUP_ID = process.env.SLIP_GROUP_ID || "";
@@ -1123,15 +1128,6 @@ async function processWebhookEvent(event) {
 async function processWebhookEvents(events, eventHandler = processWebhookEvent) {
   return processWebhookBatch(events, eventHandler, console);
 }
-
-app.post("/webhook", (req, res) => {
-  const events = req.body?.events || [];
-  console.log("EVENT =", JSON.stringify(req.body));
-
-  // LINE expects a quick acknowledgement; process every event in the batch afterwards.
-  res.sendStatus(200);
-  void processWebhookEvents(events);
-});
 
 app.post("/notify-new-po", async (req, res) => {
   const { filename, image_b64, secret } = req.body;
