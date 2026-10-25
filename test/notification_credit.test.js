@@ -90,9 +90,10 @@ test("existing mail route and Auto PO each send exactly one decorated text", asy
   const fs = require("node:fs");
   const path = require("node:path");
   const routes = new Map();
-  const app = { use() {}, get(route, handler) { routes.set(route, handler); }, post(route, handler) { routes.set(route, handler); } };
+  const app = { use() {}, get(route, handler) { routes.set(route, handler); }, post(route, ...handlers) { routes.set(route, handlers.at(-1)); } };
   const express = () => app;
   express.json = () => () => {};
+  express.raw = () => () => {};
   const calls = [];
   const http = mockHttp();
   http.post = async (url, body) => {
@@ -111,7 +112,7 @@ test("existing mail route and Auto PO each send exactly one decorated text", asy
       return require(name.startsWith(".") ? path.resolve(path.dirname(indexPath), name) : name);
     },
     module: { exports: {} }, __dirname: path.dirname(indexPath),
-    process: { env: { PO_SECRET: "test-secret", LINE_NOTIFY_TARGET: "Ctest-group" } },
+    process: { env: { PO_SECRET: "test-secret", LINE_CHANNEL_SECRET: "test-channel-secret", LINE_NOTIFY_TARGET: "Ctest-group" } },
     console: { log() {}, warn() {}, error() {} }, Buffer, setTimeout, setInterval, clearTimeout,
   };
   vm.runInNewContext(fs.readFileSync(indexPath, "utf8"), sandbox, { filename: indexPath });

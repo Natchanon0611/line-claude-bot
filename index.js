@@ -160,43 +160,24 @@ async function lineReply(replyToken, text) {
   );
 }
 
-async function linePush(to, text, credit) {
+async function linePush(to, text, credit, poImage) {
   if (!isLineGroupId(to)) {
     console.warn(`[LINE] blocked push to non-group target: ${to || "EMPTY"}`);
     return { skipped: true, reason: "non_group_target" };
   }
   const decorated = await notificationCredit.text(text, credit);
-  await axios.post(
-    "https://api.line.me/v2/bot/message/push",
-    { to, messages: [{ type: "text", text: decorated }] },
-    { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
-  );
-}
-
-async function linePushImage(to, imageUrl, previewImageUrl = imageUrl) {
-  if (!isLineGroupId(to)) {
-    console.warn(`[LINE] blocked image push to non-group target: ${to || "EMPTY"}`);
-    return { skipped: true, reason: "non_group_target" };
+  const messages = [{ type: "text", text: decorated }];
+  if (poImage?.image_b64) {
+    const id = storePoImage(poImage.image_b64, poImage.preview_b64);
+    const urls = poImageUrls(id);
+    messages.push({ type: "image", originalContentUrl: urls.original, previewImageUrl: urls.preview });
   }
+  // LINE charges per recipient per request: keep the PO text and image together.
   await axios.post(
     "https://api.line.me/v2/bot/message/push",
-    {
-      to,
-      messages: [{
-        type: "image",
-        originalContentUrl: imageUrl,
-        previewImageUrl
-      }]
-    },
+    { to, messages },
     { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
   );
-}
-
-async function linePushPoImage(to, item) {
-  if (!item?.image_b64) return;
-  const id = storePoImage(item.image_b64, item.preview_b64);
-  const urls = poImageUrls(id);
-  await linePushImage(to, urls.original, urls.preview);
 }
 
 async function linePushFlex(to, altText, contents) {
@@ -253,8 +234,8 @@ async function lineBroadcastImage(imageUrl) {
 //  Process Sign Result (shared logic)
 // ─────────────────────────────────────────────
 async function processPOSignResult(data, senderName, notifyId) {
-  const send = async (text, credit = data.credit) => {
-    try { await linePush(notifyId, text, credit); } catch (e) {
+  const send = async (text, credit = data.credit, poImage) => {
+    try { await linePush(notifyId, text, credit, poImage); } catch (e) {
       console.error("[SEND] linePush failed:", e.response?.status, e.message);
     }
   };
@@ -290,12 +271,8 @@ async function processPOSignResult(data, senderName, notifyId) {
         `⚠️ Claude หาตำแหน่งลายเซ็นไม่เจอ\n━━━━━━━━━━━━━━━\n` +
         `📄 PO: ${item.po_id}\n👤 สั่งโดย: ${senderName}\n━━━━━━━━━━━━━━━\n` +
         `ตรวจสอบรูปด้านล่าง แล้วตอบ:\n✅ "ยืนยัน" — ส่งเมล + ปริ้น\n❌ "ยกเลิก" — ลบและส่ง PO ใหม่`,
-        item.credit
+        item.credit, item
       );
-      if (item.image_b64) {
-        try { await linePushPoImage(notifyId, item); }
-        catch (e) { console.error("[SEND] linePushImage failed:", e.response?.status, e.message); }
-      }
       continue;
     }
 
@@ -328,13 +305,8 @@ async function processPOSignResult(data, senderName, notifyId) {
       `📄 PO: ${item.po_id}\n` + quotationLine + factoryLine + quotationMoveLine + fileLine + waitingLine +
       `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
       nasLine + printLine + `━━━━━━━━━━━━━━━`,
-      item.credit
+      item.credit, item
     );
-
-    if (item.image_b64) {
-      try { await linePushPoImage(notifyId, item); }
-      catch (e) { console.error("[SEND] linePushImage failed:", e.response?.status, e.message); }
-    }
   }
 
   for (const item of (data.failed || [])) {
@@ -1141,20 +1113,10 @@ app.post("/notify-new-po", async (req, res) => {
 
     if (target) {
       try {
-        await linePush(target, `📨 มี PO ใหม่เข้ามาครับ\n📄 ${filename}`);
-        console.log(`[NOTIFY] text push OK to ${target}`);
+        await linePush(target, `📨 มี PO ใหม่เข้ามาครับ\n📄 ${filename}`, undefined, { image_b64, preview_b64: req.body.preview_b64 });
+        console.log(`[NOTIFY] PO push OK to ${target}`);
       } catch (e) {
-        console.error(`[NOTIFY] text push FAILED: ${e.response?.status} ${e.message}`);
-      }
-      if (image_b64) {
-        const id = storePoImage(image_b64, req.body.preview_b64);
-        const imageUrl = poImageUrls(id);
-        try {
-          await linePushImage(target, imageUrl.original, imageUrl.preview);
-          console.log(`[NOTIFY] image push OK`);
-        } catch (e) {
-          console.error(`[NOTIFY] image push FAILED: ${e.response?.status} ${e.message}`);
-        }
+        console.error(`[NOTIFY] PO push FAILED: ${e.response?.status} ${e.message}`);
       }
     } else {
       console.warn("[NOTIFY] no target — set LINE_NOTIFY_TARGET or SLIP_GROUP_ID env var");
@@ -1188,28 +1150,16 @@ app.post("/auto-sign-po", async (req, res) => {
   // [TARGET MODE] Send only to configured LINE_NOTIFY_TARGET/SLIP_GROUP_ID.
   const notifyTarget = getNotifyTarget();
 
-  const bsend = async (text, credit) => {
+  const bsend = async (text, credit, poImage) => {
     if (!notifyTarget) {
       console.warn("[AUTO-SIGN] no notify target - set LINE_NOTIFY_TARGET or SLIP_GROUP_ID to a groupId");
       return;
     }
     try {
-      await linePush(notifyTarget, text, credit);
+      await linePush(notifyTarget, text, credit, poImage);
       console.log(`[AUTO-SIGN] push OK to ${notifyTarget} (${String(text).substring(0,30)}...)`);
     } catch (e) {
       console.error(`[AUTO-SIGN] push FAILED: ${e.response?.status} ${e.message}`);
-    }
-  };
-  const bsendImage = async (imageUrl, previewImageUrl = imageUrl) => {
-    if (!notifyTarget) {
-      console.warn("[AUTO-SIGN] no notify target for image - set LINE_NOTIFY_TARGET or SLIP_GROUP_ID to a groupId");
-      return;
-    }
-    try {
-      await linePushImage(notifyTarget, imageUrl, previewImageUrl);
-      console.log(`[AUTO-SIGN] push image OK to ${notifyTarget}`);
-    } catch (e) {
-      console.error(`[AUTO-SIGN] push image FAILED: ${e.response?.status} ${e.message}`);
     }
   };
 
@@ -1290,14 +1240,8 @@ app.post("/auto-sign-po", async (req, res) => {
         `📄 PO: ${item.po_id}\n` + quotationLine + factoryLine + quotationMoveLine + fileLine + waitingLine +
         `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
         nasLine + printLine + `━━━━━━━━━━━━━━━`,
-        item.credit
+        item.credit, item
       );
-
-      if (item.image_b64) {
-        const id = storePoImage(item.image_b64, item.preview_b64);
-        const urls = poImageUrls(id);
-        await bsendImage(urls.original, urls.preview);
-      }
     }
 
     for (const item of (data.failed || [])) {
