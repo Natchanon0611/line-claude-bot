@@ -1,4 +1,4 @@
-// Credits decorate existing notifications; this module never sends messages.
+// Balances appear only in the daily-summary Flex; this module never sends messages.
 const LINE_API = "https://api.line.me/v2/bot/message";
 
 function numberOrNull(value) {
@@ -9,22 +9,15 @@ function numberOrNull(value) {
 
 function usd(value) {
   const n = numberOrNull(value);
-  return n === null ? "ไม่ทราบ" : `≈$${n.toFixed(6)}`;
+  return n === null ? "ไม่ทราบ" : `≈$${n.toFixed(2)}`;
 }
 
 function creditLines(credit, quota, { includeClaude = true } = {}) {
   const lines = [];
   if (includeClaude) {
     if (credit && typeof credit === "object") {
-      if (Object.hasOwn(credit, "job_estimated_usd")) {
-        lines.push(`💳 Claude งานนี้: ${usd(credit.job_estimated_usd)}`);
-      }
-      lines.push(`Claude ใช้สะสมที่นับ: ${usd(credit.total_estimated_usd)}`);
-      const budget = numberOrNull(credit.budget_usd);
       const remaining = credit.estimate_complete === false ? null : credit.remaining_estimated_usd;
-      lines.push(`Claude เหลือโดยประมาณ: ${usd(remaining)}` +
-        (budget === null ? "" : ` (ตั้งต้น $${budget.toFixed(2)})`));
-      lines.push("เฉพาะที่ระบบนับ ไม่ใช่ยอดบัญชีจริง");
+      lines.push(`💳 Claude (ระบบนับ): ใช้สะสม ${usd(credit.total_estimated_usd)} | เหลือ ${usd(remaining)}`);
     } else {
       lines.push("💳 Claude: ตรวจสอบยอดไม่ได้ชั่วคราว");
     }
@@ -34,11 +27,10 @@ function creditLines(credit, quota, { includeClaude = true } = {}) {
     if (quota.type === "limited") {
       const limit = quota.limit.toLocaleString("en-US");
       const remaining = Math.max(0, quota.limit - quota.used).toLocaleString("en-US");
-      lines.push(`💬 LINE เดือนนี้: ใช้ ≈${used} | เหลือ ≈${remaining}/${limit} ข้อความ`);
+      lines.push(`💬 LINE เดือนนี้: เหลือ ≈${remaining}/${limit} (ก่อนส่ง)`);
     } else {
       lines.push(`💬 LINE เดือนนี้: ใช้ ≈${used} ข้อความ | ไม่ได้ตั้งเพดานโควตา`);
     }
-    lines.push("ยอด LINE ก่อนส่งจาก API อาจอัปเดตช้า");
   } else {
     lines.push("💬 LINE คงเหลือ: ตรวจสอบไม่ได้ชั่วคราว");
   }
@@ -100,10 +92,9 @@ function createCreditDecorator({ http, lineToken, localUrl, secret }) {
   }
   return {
     snapshot,
-    async text(text, credit) {
-      // The exhausted-credit alert already has its own more specific summary.
-      const includeClaude = !String(text).startsWith("🚨 เครดิต Claude API หมด");
-      return appendCreditText(text, await lines(credit, { includeClaude }));
+    async text(text) {
+      // Routine replies, PO results and mail alerts neither fetch nor show balances.
+      return String(text || "").slice(0, 2000);
     },
     async flex(contents, credit) {
       const copy = JSON.parse(JSON.stringify(contents));
