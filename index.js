@@ -167,8 +167,9 @@ async function linePush(to, text, credit, poImage) {
   }
   const decorated = await notificationCredit.text(text, credit);
   const messages = [{ type: "text", text: decorated }];
-  if (poImage?.image_b64) {
-    const id = storePoImage(poImage.image_b64, poImage.preview_b64);
+  const originalImage = poImage?.image_b64 || poImage?.preview_b64;
+  if (originalImage) {
+    const id = storePoImage(originalImage, poImage.preview_b64);
     const urls = poImageUrls(id);
     messages.push({ type: "image", originalContentUrl: urls.original, previewImageUrl: urls.preview });
   }
@@ -233,33 +234,45 @@ async function lineBroadcastImage(imageUrl) {
 // ─────────────────────────────────────────────
 //  Process Sign Result (shared logic)
 // ─────────────────────────────────────────────
+function poMessageField(value, limit = 200) {
+  const text = String(value || "");
+  return text.length > limit ? text.slice(0, limit - 1) + "…" : text;
+}
+
 async function processPOSignResult(data, senderName, notifyId) {
+  const delivery = { sent: 0, failed: 0 };
+  senderName = poMessageField(senderName, 80);
   const send = async (text, credit = data.credit, poImage) => {
-    try { await linePush(notifyId, text, credit, poImage); } catch (e) {
+    try {
+      const result = await linePush(notifyId, text, credit, poImage);
+      if (result?.skipped) delivery.failed += 1;
+      else delivery.sent += 1;
+    } catch (e) {
+      delivery.failed += 1;
       console.error("[SEND] linePush failed:", e.response?.status, e.message);
     }
   };
 
   if (data.status === "busy") {
     await send(`⚠️ กำลังลงลายเซ็นอยู่แล้วครับ\n👤 สั่งโดย: ${senderName}\nรอให้เสร็จก่อนแล้วค่อยสั่งใหม่`);
-    return;
+    return delivery;
   }
   if (data.status === "no_files") {
     await send("✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ");
-    return;
+    return delivery;
   }
   if (data.status === "ignored") {
-    return;
+    return delivery;
   }
-  if ((data.status !== "success" || !data.signed?.length) && !(data.failed || []).length) {
-    await send("⚠️ " + (data.message || "เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ"));
+  if (!data.signed?.length && !(data.failed || []).length) {
+    await send("⚠️ " + poMessageField(data.message || "เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ", 1000));
   }
 
   const now = new Date().toLocaleString("th-TH", {
     timeZone: "Asia/Bangkok", year: "numeric", month: "2-digit", day: "2-digit",
     hour: "2-digit", minute: "2-digit"
   });
-  const modeLine = data.dry_run ? "โหมดทดสอบ: ไม่ปริ้น ไม่ย้าย NAS ไม่ลบต้นฉบับ\n" : "";
+  const modeLine = data.dry_run ? "โหมดทดสอบ: ไม่ส่งเมล ไม่ปริ้น ไม่ย้าย NAS ไม่ลบต้นฉบับ\n" : "";
 
   for (const item of (data.signed || [])) {
     if (item.needs_confirmation) {
@@ -269,8 +282,10 @@ async function processPOSignResult(data, senderName, notifyId) {
       });
       await send(
         `⚠️ Claude หาตำแหน่งลายเซ็นไม่เจอ\n━━━━━━━━━━━━━━━\n` +
-        `📄 PO: ${item.po_id}\n👤 สั่งโดย: ${senderName}\n━━━━━━━━━━━━━━━\n` +
-        `ตรวจสอบรูปด้านล่าง แล้วตอบ:\n✅ "ยืนยัน" — ส่งเมล + ปริ้น\n❌ "ยกเลิก" — ลบและส่ง PO ใหม่`,
+        `📄 PO: ${poMessageField(item.po_id, 80)}\n👤 สั่งโดย: ${senderName}\n━━━━━━━━━━━━━━━\n` +
+        `ตรวจสอบไฟล์และรูปตัวอย่าง แล้วตอบ:\n✅ "ยืนยัน" — ยืนยันตำแหน่งลายเซ็น\n❌ "ยกเลิก" — คืนต้นฉบับเพื่อแก้ไข\n` +
+        `การส่งอีเมลยังต้องอนุมัติผ่านโฟลเดอร์ A2-2` +
+        (!(item.image_b64 || item.preview_b64) ? "\n🖼️ ภาพตัวอย่าง: ไม่พร้อมใช้งาน" : ""),
         item.credit, item
       );
       continue;
@@ -281,45 +296,50 @@ async function processPOSignResult(data, senderName, notifyId) {
       const confEmoji = item.matched_confidence === "high"   ? "🟢"
                       : item.matched_confidence === "medium" ? "🟡"
                       : item.matched_confidence === "low"    ? "🔴" : "⚪";
-      quotationLine = `📋 ใบเสนอราคา: ${item.matched_quotation}\n   ${confEmoji} ความมั่นใจ: ${item.matched_confidence || "?"}\n`;
+      quotationLine = `📋 ใบเสนอราคา: ${poMessageField(item.matched_quotation)}\n   ${confEmoji} ความมั่นใจ: ${poMessageField(item.matched_confidence || "?", 30)}\n`;
     } else {
-      quotationLine = `📋 ใบเสนอราคา: ไม่พบที่ตรงกันใน NAS ⚠️\n`;
+      quotationLine = data.dry_run ? "📋 ใบเสนอราคา: โหมดทดสอบยังไม่จับคู่\n" : "📋 ใบเสนอราคา: ไม่พบที่ตรงกันใน NAS ⚠️\n";
     }
     const quotationMoveLine = item.quotation_moved
-                        ? `📁 ย้ายใบเสนอราคาเข้า V2-2 แล้ว ✓\n`
-                        : item.quotation_move_error ? `📁 ย้ายใบเสนอราคาเข้า V2-2 ไม่สำเร็จ ✗ (${item.quotation_move_error})\n` : "";
-    const factoryLine = item.factory ? `🏭 โรงงาน: ${item.factory}\n` : "";
+                        ? `📁 ย้ายใบเสนอราคาแล้ว ✓\n`
+                        : item.quotation_move_error ? `📁 ย้ายใบเสนอราคาไม่สำเร็จ ✗ (${poMessageField(item.quotation_move_error, 180)})\n` : "";
+    const factoryLine = item.factory ? `🏭 โรงงาน: ${poMessageField(item.factory, 80)}\n` : "";
 
     const nasLine   = item.nas_ok
-                        ? `📂 NAS: คัดลอกแล้ว ✓\n${item.nas_path ? `   ${item.nas_path}\n` : ""}`
-                        : item.nas_error ? `📂 NAS: ล้มเหลว ✗ (${item.nas_error})\n` : "";
+                        ? `📂 NAS: คัดลอกแล้ว ✓\n${item.nas_path ? `   ${poMessageField(item.nas_path, 320)}\n` : ""}`
+                        : item.nas_error ? `📂 NAS: ล้มเหลว ✗ (${poMessageField(item.nas_error, 180)})\n` : "";
     const printLine = item.print_ok    ? "🖨️  ปริ้น: สั่งแล้ว ✓\n"
-                    : item.print_error ? `🖨️  ปริ้น: ล้มเหลว ✗ (${item.print_error})\n` : "";
-    const fileLine  = item.output_file ? `📄 ไฟล์: ${item.output_file}\n` : "";
-    const waitingLine = item.output_file?.startsWith("W-")
+                    : item.print_error ? `🖨️  ปริ้น: ล้มเหลว ✗ (${poMessageField(item.print_error, 180)})\n`
+                    : item.print_status === "deferred_until_mail_sent" ? "🖨️  ปริ้น: รอส่งอีเมลสำเร็จ\n" : "";
+    const fileLine  = item.output_file ? `📄 ไฟล์: ${poMessageField(item.output_file)}\n` : "";
+    const waitingLine = !data.dry_run && item.output_file?.startsWith("W-")
                     ? "⏳ สถานะ: รอตรวจ ก่อนส่งเมลยืนยัน\n" : "";
+    const imageLine = item.image_b64 || item.preview_b64 ? "" : "🖼️ ภาพตัวอย่าง: ไม่พร้อมใช้งาน\n";
 
     await send(
       `✅ เซ็น PO เสร็จแล้ว\n━━━━━━━━━━━━━━━\n` +
       modeLine +
-      `📄 PO: ${item.po_id}\n` + quotationLine + factoryLine + quotationMoveLine + fileLine + waitingLine +
+      `📄 PO: ${poMessageField(item.po_id, 80)}\n` + quotationLine + factoryLine + quotationMoveLine + fileLine + waitingLine +
       `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
-      nasLine + printLine + `━━━━━━━━━━━━━━━`,
+      nasLine + printLine + imageLine + `━━━━━━━━━━━━━━━`,
       item.credit, item
     );
   }
 
   for (const item of (data.failed || [])) {
-    const manualLine = item.manual_file ? `📁 ย้ายไปตรวจมือ: ${item.manual_file}\n` : "";
+    const manualLine = item.manual_file ? `📁 ย้ายไปตรวจมือ: ${poMessageField(item.manual_file, 320)}\n` : "";
+    const moveErrorLine = item.move_error ? `📁 ย้ายไปตรวจมือไม่สำเร็จ: ${poMessageField(item.move_error, 180)}\n` : "";
+    const heading = data.status === "held" ? "⏸️ พักการเซ็น PO" : "❌ เซ็น PO ไม่สำเร็จ";
     await send(
-      `❌ เซ็น PO ไม่สำเร็จ\n━━━━━━━━━━━━━━━\n` +
+      `${heading}\n━━━━━━━━━━━━━━━\n` +
       modeLine +
-      `📄 ไฟล์: ${item.file}\n⚠️ สาเหตุ: ${item.error}\n` +
-      manualLine +
+      `📄 ไฟล์: ${poMessageField(item.file)}\n⚠️ สาเหตุ: ${poMessageField(item.error, 700)}\n` +
+      manualLine + moveErrorLine +
       `━━━━━━━━━━━━━━━`,
-      item.credit
+      item.credit, item
     );
   }
+  return delivery;
 }
 
 // ─────────────────────────────────────────────
@@ -549,8 +569,8 @@ async function handleConfirmCancel(event) {
         `✅ ยืนยันลายเซ็น PO แล้ว\n` +
         `━━━━━━━━━━━━━━━\n` +
         `📄 PO: ${po_id}\n` +
-        `📧 อีเมล: ${d.email_sent ? "ส่งสำเร็จ ✓" : "ส่งไม่สำเร็จ ✗"}\n` +
-        `🖨️  ปริ้น: ${d.print_ok ? "สั่งแล้ว ✓" : "ล้มเหลว ✗"}\n` +
+        `📧 อีเมล: ${d.email_sent ? "ส่งสำเร็จ ✓" : d.print_status === "deferred_until_mail_sent" ? "รออนุมัติผ่านโฟลเดอร์ A2-2" : "ส่งไม่สำเร็จ ✗"}\n` +
+        `🖨️  ปริ้น: ${d.print_ok ? "สั่งแล้ว ✓" : d.print_status === "deferred_until_mail_sent" ? "รอส่งอีเมลสำเร็จ" : "ล้มเหลว ✗"}\n` +
         `━━━━━━━━━━━━━━━`
       ).catch(()=>{});
     } else {
@@ -1190,72 +1210,40 @@ app.post("/auto-sign-po", async (req, res) => {
 
     console.log(`[AUTO-SIGN] response: status=${data.status} signed=${data.signed?.length || 0} failed=${data.failed?.length || 0}`);
 
-    if (data.status === "busy") {
-      await bsend(`⚠️ Auto-sign ยังชนงานเซ็นที่กำลังรันอยู่หลัง retry แล้ว\n━━━━━━━━━━━━━━━\n📄 ไฟล์: ${filename}\n👤 สั่งโดย: ${senderName}\nระบบ watcher จะลองส่งใหม่ถ้าไฟล์ยังค้างอยู่`);
-      return;
-    }
-    if (data.status === "no_files") {
-      await bsend(`✅ ไม่มี PO ที่รอลงลายเซ็นในขณะนี้ครับ`);
-      return;
-    }
-    if (data.status === "ignored") {
-      return;
-    }
-    if (data.status !== "success" && !(data.failed || []).length) {
-      await bsend(`⚠️ Auto-sign มีข้อผิดพลาด\n━━━━━━━━━━━━━━━\n📄 ไฟล์: ${filename}\n⚠️ ${data.message || "ไม่ทราบสาเหตุ"}\n━━━━━━━━━━━━━━━`);
-      return;
-    }
-
-    const now = new Date().toLocaleString("th-TH", {
-      timeZone: "Asia/Bangkok", year: "numeric", month: "2-digit", day: "2-digit",
-      hour: "2-digit", minute: "2-digit"
-    });
-
-    for (const item of (data.signed || [])) {
-      let quotationLine = "";
-      if (item.matched_quotation) {
-        const confEmoji = item.matched_confidence === "high"   ? "🟢"
-                        : item.matched_confidence === "medium" ? "🟡"
-                        : item.matched_confidence === "low"    ? "🔴" : "⚪";
-        quotationLine = `📋 ใบเสนอราคา: ${item.matched_quotation}\n   ${confEmoji} ความมั่นใจ: ${item.matched_confidence || "?"}\n`;
-      } else {
-        quotationLine = `📋 ใบเสนอราคา: ไม่พบที่ตรงกันใน NAS ⚠️\n`;
-      }
-      const quotationMoveLine = item.quotation_moved
-                          ? `📁 ย้ายใบเสนอราคาเข้า V2-2 แล้ว ✓\n`
-                          : item.quotation_move_error ? `📁 ย้ายใบเสนอราคาเข้า V2-2 ไม่สำเร็จ ✗ (${item.quotation_move_error})\n` : "";
-      const factoryLine = item.factory ? `🏭 โรงงาน: ${item.factory}\n` : "";
-
-      const nasLine   = item.nas_ok
-                          ? `📂 NAS: คัดลอกแล้ว ✓\n${item.nas_path ? `   ${item.nas_path}\n` : ""}`
-                          : item.nas_error ? `📂 NAS: ล้มเหลว ✗ (${item.nas_error})\n` : "";
-      const printLine = item.print_ok    ? "🖨️  ปริ้น: สั่งแล้ว ✓\n"
-                      : item.print_error ? `🖨️  ปริ้น: ล้มเหลว ✗ (${item.print_error})\n` : "";
-      const fileLine  = item.output_file ? `📄 ไฟล์: ${item.output_file}\n` : "";
-      const waitingLine = item.output_file?.startsWith("W-")
-                      ? "⏳ สถานะ: รอตรวจ ก่อนส่งเมลยืนยัน\n" : "";
-
-      await bsend(
-        `✅ เซ็น PO เสร็จแล้ว\n━━━━━━━━━━━━━━━\n` +
-        `📄 PO: ${item.po_id}\n` + quotationLine + factoryLine + quotationMoveLine + fileLine + waitingLine +
-        `📅 เวลา: ${now}\n👤 สั่งโดย: ${senderName}\n` +
-        nasLine + printLine + `━━━━━━━━━━━━━━━`,
-        item.credit, item
-      );
-    }
-
-    for (const item of (data.failed || [])) {
-      await bsend(
-        `❌ เซ็น PO ไม่สำเร็จ\n━━━━━━━━━━━━━━━\n` +
-        `📄 ไฟล์: ${item.file}\n⚠️ สาเหตุ: ${item.error}\n━━━━━━━━━━━━━━━`,
-        item.credit
-      );
-    }
+    await processPOSignResult(data, senderName, notifyTarget);
   } catch (err) {
     console.error(`[AUTO-SIGN] FAILED: ${err.message} (code=${err.code} status=${err.response?.status})`);
     await bsend(
       `❌ Auto-sign ล้มเหลว\n━━━━━━━━━━━━━━━\n📄 ไฟล์: ${filename}\n⚠️ ${err.message}\n━━━━━━━━━━━━━━━`
     );
+  }
+});
+
+// Relay an already completed local result. This endpoint never invokes the signer.
+const PO_SIGN_RESULT_PROTOCOL = "po-sign-result-v1";
+const PO_SIGN_STATUSES = new Set(["success", "partial_failed", "partial_success", "failed", "error", "held", "busy", "no_files", "ignored"]);
+app.get("/po-sign-result-capabilities", (req, res) => {
+  if (req.headers["x-po-secret"] !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
+  return res.json({ protocol: PO_SIGN_RESULT_PROTOCOL, textAndImage: true, previewFallback: true,
+    statuses: [...PO_SIGN_STATUSES], revision: process.env.RENDER_GIT_COMMIT || null });
+});
+app.post("/po-sign-result", async (req, res) => {
+  const { secret, result } = req.body || {};
+  if (secret !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
+  const isObject = (value) => value && typeof value === "object" && !Array.isArray(value);
+  if (!isObject(result) || !PO_SIGN_STATUSES.has(result.status) ||
+      [result.signed, result.failed].some((items) => items !== undefined &&
+        (!Array.isArray(items) || items.length > 100 || items.some((item) => !isObject(item))))) {
+    return res.status(400).json({ error: "Invalid signing result" });
+  }
+  const notifyTarget = getNotifyTarget();
+  if (!notifyTarget) return res.json({ status: "no_target", protocol: PO_SIGN_RESULT_PROTOCOL });
+  try {
+    const delivery = await processPOSignResult(result, "ระบบ Auto-Sign", notifyTarget);
+    return res.json({ status: delivery.failed ? "line_push_failed" : "ok", protocol: PO_SIGN_RESULT_PROTOCOL, ...delivery });
+  } catch (err) {
+    console.error("[PO-SIGN-RESULT] failed:", err.message);
+    return res.status(500).json({ status: "notification_failed", protocol: PO_SIGN_RESULT_PROTOCOL });
   }
 });
 

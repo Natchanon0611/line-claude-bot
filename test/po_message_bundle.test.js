@@ -12,8 +12,9 @@ const preview = Buffer.from('preview fixture').toString('base64');
 const po = { po_id: 'PO123', output_file: 'PO123.pdf', image_b64: original, preview_b64: preview };
 
 // Execute the actual app and routes with no credentials, network, disk writes or timers.
-function harness({ signed = [po], target = 'Ctest', failPush = false } = {}) {
+function harness({ signed = [po], result, target = 'Ctest', failPush = false, confirmResult = {} } = {}) {
   const pushes = [];
+  const calls = [];
   const files = new Map();
   const axios = {
     async get(url) {
@@ -23,12 +24,15 @@ function harness({ signed = [po], target = 'Ctest', failPush = false } = {}) {
       throw new Error(`Unexpected GET: ${url}`);
     },
     async post(url, body) {
+      calls.push({ url, body });
       if (url === 'https://api.line.me/v2/bot/message/push') {
         pushes.push(JSON.parse(JSON.stringify(body)));
         if (failPush) throw Object.assign(new Error('monthly limit'), { response: { status: 429 } });
         return { data: {} };
       }
-      if (url === 'https://local.invalid/sign-po') return { data: { status: 'success', signed } };
+      if (url === 'https://local.invalid/sign-po') return { data: result || { status: 'success', signed } };
+      if (url === 'https://local.invalid/confirm-sign') return { data: confirmResult };
+      if (url === 'https://local.invalid/cancel-sign') return { data: { status: 'cancelled' } };
       throw new Error(`Unexpected POST: ${url}`);
     },
   };
@@ -48,23 +52,29 @@ function harness({ signed = [po], target = 'Ctest', failPush = false } = {}) {
     process: { env: {
       PO_SECRET: 'test-secret', LINE_CHANNEL_SECRET: 'test-channel-secret', LINE_TOKEN: 'test-token',
       LINE_NOTIFY_TARGET: target, PO_LOCAL_URL: 'https://local.invalid', RENDER_URL: 'https://bot.invalid',
+      AUTO_SIGN_MAX_ATTEMPTS: '1', RENDER_GIT_COMMIT: 'test-revision',
     }, exit() { throw new Error('Unexpected exit'); } },
   });
   vm.runInContext(fs.readFileSync(entry, 'utf8'), context, { filename: entry });
   return {
-    pushes, files,
+    pushes, files, calls,
     sign: vm.runInContext('processPOSignResult', context),
-    async route(url, body) {
+    confirm: vm.runInContext('handleConfirmCancel', context),
+    clearImageMemory: () => vm.runInContext('imageStore.clear()', context),
+    async route(url, body, extra = {}) {
       const layer = context.module.exports.app._router.stack.find((x) => x.route?.path === url);
       assert.ok(layer, `Missing route ${url}`);
-      const response = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(value) { this.body = value; return this; } };
-      await layer.route.stack[0].handle({ body: { secret: 'test-secret', ...body } }, response);
+      const response = { statusCode: 200, headers: {}, status(code) { this.statusCode = code; return this; },
+        json(value) { this.body = value; return this; }, send(value) { this.body = value; return this; },
+        set(key, value) { this.headers[key] = value; return this; },
+        setHeader(key, value) { this.headers[key] = value; return this; } };
+      await layer.route.stack[0].handle({ body: { secret: 'test-secret', ...body }, headers: { 'x-po-secret': 'test-secret' }, ...extra }, response);
       return response;
     },
   };
 }
 
-function assertBundle(h, expectedText, expectedPreview = preview) {
+function assertBundle(h, expectedText, expectedPreview = preview, expectedOriginal = original) {
   assert.equal(h.pushes.length, 1, 'one LINE request for text and image');
   const payload = h.pushes[0];
   assert.equal(payload.to, 'Ctest');
@@ -75,7 +85,7 @@ function assertBundle(h, expectedText, expectedPreview = preview) {
   assert.equal(image.previewImageUrl, image.originalContentUrl + '/preview');
   const id = image.originalContentUrl.split('/').pop();
   const stored = [...h.files.entries()];
-  assert.ok(stored.some(([file, data]) => file.endsWith(`${id}.original.jpg`) && data.equals(Buffer.from(original, 'base64'))));
+  assert.ok(stored.some(([file, data]) => file.endsWith(`${id}.original.jpg`) && data.equals(Buffer.from(expectedOriginal, 'base64'))));
   assert.ok(stored.some(([file, data]) => file.endsWith(`${id}.preview.jpg`) && data.equals(Buffer.from(expectedPreview, 'base64'))));
 }
 
@@ -94,7 +104,7 @@ test('manual signing result sends one bundle', async () => {
 test('confirmation request keeps instructions and image in one bundle', async () => {
   const h = harness();
   await h.sign({ status: 'success', signed: [{ ...po, needs_confirmation: true }] }, 'tester', 'Ctest');
-  assertBundle(h, /ยืนยัน.*ส่งเมล[\s\S]*ยกเลิก/);
+  assertBundle(h, /ยืนยันตำแหน่งลายเซ็น[\s\S]*ยกเลิก[\s\S]*อนุมัติผ่านโฟลเดอร์ A2-2/);
 });
 
 test('auto-sign result sends one bundle', async () => {
@@ -152,9 +162,141 @@ test('non-group recipients remain blocked', async () => {
 
 test('unauthorized callbacks do not send or sign', async () => {
   const h = harness();
-  for (const route of ['/notify-new-po', '/auto-sign-po']) {
+  for (const route of ['/notify-new-po', '/auto-sign-po', '/po-sign-result']) {
     const response = await h.route(route, { secret: 'incorrect', filename: 'PO123.pdf', ...po });
     assert.equal(response.statusCode, 401);
   }
   assert.equal(h.pushes.length, 0);
+  assert.equal(h.calls.length, 0);
+});
+
+test('completed local callback sends details and image without invoking the signer', async () => {
+  const h = harness();
+  const response = await h.route('/po-sign-result', { result: { status: 'success', signed: [{ ...po,
+    output_file: 'W-PO123.pdf', matched_quotation: 'QT123.pdf', matched_confidence: 'high',
+    quotation_moved: true, nas_ok: true, nas_path: 'NAS/W-PO123.pdf', print_status: 'deferred_until_mail_sent',
+  }] } });
+  assert.equal(response.body.protocol, 'po-sign-result-v1');
+  assert.equal(response.body.status, 'ok');
+  assert.equal(response.body.sent, 1);
+  assertBundle(h, /QT123.pdf[\s\S]*ความมั่นใจ: high[\s\S]*รอตรวจ[\s\S]*ระบบ Auto-Sign[\s\S]*NAS: คัดลอกแล้ว[\s\S]*รอส่งอีเมลสำเร็จ/);
+  assert.ok(h.calls.every(c => !c.url.startsWith('https://local.invalid/')));
+});
+
+test('all sign entry points use identical result formatting', async () => {
+  for (const result of [
+    { status: 'success', signed: [po] },
+    { status: 'partial_failed', signed: [po], failed: [{ file: 'bad.pdf', error: 'signature not found', manual_file: 'Manual/bad.pdf' }] },
+    { status: 'failed', failed: [{ file: 'bad.pdf', error: 'OCR error', move_error: 'file locked' }] },
+    { status: 'held', failed: [{ file: 'old.pdf', error: 'already_signed_or_sent' }] },
+    { status: 'busy' }, { status: 'no_files' }, { status: 'ignored' },
+    { status: 'error', message: 'signer unavailable' },
+    { status: 'success', dry_run: true, signed: [po] },
+  ]) {
+    const rendered = [];
+    for (const entryPoint of ['manual', '/auto-sign-po', '/po-sign-result']) {
+      const h = harness({ result });
+      if (entryPoint === 'manual') await h.sign(result, 'ระบบ Auto-Sign', 'Ctest');
+      else await h.route(entryPoint, { filename: 'PO123.pdf', result });
+      rendered.push(h.pushes.map(p => p.messages.map(m => m.type === 'text' ? m.text : m.type)));
+    }
+    assert.deepEqual(rendered[1], rendered[0], result.status);
+    assert.deepEqual(rendered[2], rendered[0], result.status);
+  }
+});
+
+test('partial failure reports each outcome once, including manual-review destination', async () => {
+  const h = harness();
+  const r = await h.route('/po-sign-result', { result: { status: 'partial_failed', signed: [po],
+    failed: [{ file: 'bad.pdf', error: 'no signature', manual_file: 'Manual/bad.pdf', image_b64: original }] } });
+  assert.equal(r.body.sent, 2);
+  assert.equal(h.pushes.length, 2);
+  assert.match(h.pushes[1].messages[0].text, /เซ็น PO ไม่สำเร็จ[\s\S]*Manual\/bad.pdf/);
+  assert.deepEqual(h.pushes[1].messages.map(m => m.type), ['text', 'image']);
+});
+
+test('missing full image uses preview; missing both is explicitly reported', async () => {
+  const h = harness();
+  await h.route('/po-sign-result', { result: { status: 'success', signed: [{ ...po, image_b64: '' }] } });
+  assertBundle(h, /เซ็น PO เสร็จแล้ว/, preview, preview);
+  const empty = harness();
+  await empty.route('/po-sign-result', { result: { status: 'success', signed: [{ po_id: 'PO123' }] } });
+  assert.equal(empty.pushes[0].messages.length, 1);
+  assert.match(empty.pushes[0].messages[0].text, /ภาพตัวอย่าง: ไม่พร้อมใช้งาน/);
+});
+
+test('image URLs serve original and preview bytes, including disk cache fallback', async () => {
+  const h = harness();
+  await h.route('/po-sign-result', { result: { status: 'success', signed: [po] } });
+  const id = h.pushes[0].messages[1].originalContentUrl.split('/').pop();
+  for (const diskOnly of [false, true]) {
+    if (diskOnly) h.clearImageMemory();
+    for (const [route, expected] of [['/po-image/:id', original], ['/po-image/:id/preview', preview]]) {
+      const response = await h.route(route, {}, { params: { id } });
+      assert.ok(response.body.equals(Buffer.from(expected, 'base64')));
+      assert.equal(response.headers['Content-Type'], 'image/jpeg');
+    }
+  }
+});
+
+test('long errors cannot hide time, NAS status or missing image notice', async () => {
+  const h = harness();
+  await h.route('/po-sign-result', { result: { status: 'success', signed: [{
+    po_id: 'PO123', output_file: 'W-' + 'f'.repeat(1000), matched_quotation: 'q'.repeat(1000),
+    matched_confidence: 'high', factory: 'factory'.repeat(100), quotation_move_error: 'locked'.repeat(1000),
+    nas_error: 'unavailable'.repeat(1000), print_error: 'printer'.repeat(1000),
+  }] } });
+  const text = h.pushes[0].messages[0].text;
+  assert.ok(text.length < 2000);
+  for (const marker of ['เวลา:', 'สั่งโดย:', 'NAS: ล้มเหลว', 'ปริ้น: ล้มเหลว', 'ภาพตัวอย่าง: ไม่พร้อมใช้งาน']) assert.ok(text.includes(marker), marker);
+});
+
+test('dry run never claims awaiting approval, NAS copy or print', async () => {
+  const h = harness();
+  await h.route('/po-sign-result', { result: { status: 'success', dry_run: true, signed: [po] } });
+  const text = h.pushes[0].messages[0].text;
+  assert.match(text, /โหมดทดสอบ: ไม่ส่งเมล ไม่ปริ้น ไม่ย้าย NAS/);
+  assert.doesNotMatch(text, /รอตรวจ|คัดลอกแล้ว|ปริ้น: สั่งแล้ว/);
+});
+
+test('callback detects blocked/failed delivery and does not retry or claim success', async () => {
+  for (const options of [{ failPush: true }, { target: '' }, { target: 'Utest' }]) {
+    const h = harness(options);
+    const response = await h.route('/po-sign-result', { result: { status: 'success', signed: [po] } });
+    assert.equal(response.body.status, options.failPush ? 'line_push_failed' : 'no_target');
+    assert.equal(h.pushes.length, options.failPush ? 1 : 0);
+    assert.ok(h.calls.every(c => !c.url.endsWith('/sign-po')));
+  }
+});
+
+test('capabilities is authenticated and read-only; invalid results are rejected', async () => {
+  const h = harness();
+  const response = await h.route('/po-sign-result-capabilities');
+  assert.equal(response.body.protocol, 'po-sign-result-v1');
+  assert.equal(response.body.revision, 'test-revision');
+  assert.equal((await h.route('/po-sign-result-capabilities', {}, { headers: {} })).statusCode, 401);
+  for (const result of [undefined, [], {}, { status: 'bogus' }, { status: 'success', signed: [null] }, { status: 'failed', failed: {} }]) {
+    assert.equal((await h.route('/po-sign-result', { result })).statusCode, 400);
+  }
+  assert.equal(h.calls.length, 0);
+});
+
+test('legacy confirmation and cancel describe actual deferred workflow', async () => {
+  for (const action of ['ยืนยัน', 'ยกเลิก']) {
+    const h = harness({ confirmResult: { email_sent: false, print_ok: false, print_status: 'deferred_until_mail_sent' } });
+    await h.sign({ status: 'success', signed: [{ ...po, needs_confirmation: true }] }, 'tester', 'Ctest');
+    await h.confirm({ message: { text: action }, source: { groupId: 'Ctest' } });
+    const text = h.pushes[1].messages[0].text;
+    if (action === 'ยืนยัน') {
+      assert.match(text, /รออนุมัติผ่านโฟลเดอร์ A2-2[\s\S]*รอส่งอีเมลสำเร็จ/);
+      assert.doesNotMatch(text, /ล้มเหลว|ส่งไม่สำเร็จ/);
+    } else assert.match(text, /ยกเลิก[\s\S]*ไฟล์ต้นฉบับถูกคืน/);
+  }
+});
+
+test('mail results remain a separate text-only message', async () => {
+  const h = harness();
+  await h.route('/po-mail-result', { text: '📧 สรุปส่งเมลยืนยัน PO\n✅ ส่งสำเร็จ 1 ไฟล์' });
+  assert.deepEqual(h.pushes[0].messages.map(m => m.type), ['text']);
+  assert.match(h.pushes[0].messages[0].text, /สรุปส่งเมลยืนยัน PO/);
 });
