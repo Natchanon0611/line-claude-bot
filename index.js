@@ -5,6 +5,7 @@ const path = require("path");
 const { processWebhookBatch } = require("./webhook_batch");
 const { createCreditDecorator } = require("./notification_credit");
 const { registerLineWebhook } = require("./line_webhook");
+const { buildDailySummaryMessages, dailySummaryTotalCount } = require("./daily_summary");
 const app = express();
 
 
@@ -43,8 +44,8 @@ function isLineGroupId(id) {
 
 function getLineAttachmentGroups() {
   return [
-    { company: "fes", label: "FES", groupId: SLIP_GROUP_ID, includeMailDocs: true },
-    { company: "ampohm", label: "AmpOhm", groupId: AMPOHM_GROUP_ID, includeMailDocs: false },
+    { company: "fes", label: "FES", groupId: SLIP_GROUP_ID, includeMailDocs: true, dailySummaryEnabled: true },
+    { company: "ampohm", label: "AmpOhm", groupId: AMPOHM_GROUP_ID, includeMailDocs: false, dailySummaryEnabled: false },
   ].filter((group) => isLineGroupId(group.groupId));
 }
 
@@ -807,9 +808,9 @@ async function retryPendingSlips() {
 }
 
 // ─────────────────────────────────────────────
-//  Daily Summary v3 — mail documents + money slips
+//  Daily Summary v4 — every email and LINE file; FES only
 //  ยิงตอน 18:00 Asia/Bangkok ครอบช่วง 18:01 เมื่อวาน → 18:00 วันนี้ (24h เต็ม)
-//  ใช้ /mail-doc-stats + /slip-stats ของ Flask แล้วส่งเข้า SLIP_GROUP_ID เป็น Flex ตารางเดียว
+//  ใช้ /mail-doc-stats + /line-inbox-stats; paginate every filename within LINE limits
 // ─────────────────────────────────────────────
 
 function getYesterdayBkk(todayYmd) {
@@ -841,146 +842,8 @@ async function fetchDailyStat(endpoint, today, lineGroup = null) {
   }
 }
 
-function shortText(value, maxLen = 38) {
-  const text = String(value || "-").trim();
-  if (text.length <= maxLen) return text;
-  return `${text.slice(0, maxLen - 1)}…`;
-}
-
-const THAI_MONTHS_SHORT = [
-  "ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.",
-  "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.",
-];
-
-function formatThaiDate(ymd) {
-  const [y, m, d] = String(ymd || "").split("-").map(Number);
-  if (!y || !m || !d) return String(ymd || "-");
-  return `${d} ${THAI_MONTHS_SHORT[m - 1]} ${y + 543}`;
-}
-
-function flexText(text, options = {}) {
-  return {
-    type: "text",
-    text: String(text ?? "-"),
-    wrap: options.wrap ?? true,
-    ...options,
-  };
-}
-
-function buildDailySummaryFlex(mailDocStat, lineDocStat, today, yesterday) {
-  const docsOk = !!mailDocStat.ok;
-  const rows = docsOk && Array.isArray(mailDocStat.rows) ? mailDocStat.rows : [];
-  const countText = docsOk ? `ดาวน์โหลดทั้งหมด ${mailDocStat.count} ไฟล์` : `ตรวจเอกสารไม่ได้ (${mailDocStat.error})`;
-  const lineDocText = lineDocStat.ok ? `LINE inbox ${lineDocStat.count} ไฟล์` : `LINE inbox ตรวจไม่ได้`;
-
-  const bodyContents = [
-    {
-      type: "box",
-      layout: "horizontal",
-      contents: [
-        flexText("#", { size: "xs", weight: "bold", flex: 1, color: "#555555", wrap: false }),
-        flexText("หน่วยงาน", { size: "xs", weight: "bold", flex: 4, color: "#555555" }),
-        flexText("ไฟล์", { size: "xs", weight: "bold", flex: 6, color: "#555555" }),
-      ],
-    },
-    { type: "separator", margin: "xs" },
-  ];
-
-  if (!docsOk) {
-    bodyContents.push({
-      type: "box",
-      layout: "horizontal",
-      margin: "sm",
-      contents: [
-        flexText("!", { size: "xs", flex: 1, color: "#B00020", wrap: false }),
-        flexText("ระบบ", { size: "xs", flex: 4, color: "#B00020" }),
-        flexText(mailDocStat.error || "ตรวจไม่ได้", { size: "xs", flex: 6, color: "#B00020" }),
-      ],
-    });
-  } else if (rows.length === 0) {
-    bodyContents.push({
-      type: "box",
-      layout: "horizontal",
-      margin: "sm",
-      contents: [
-        flexText("-", { size: "xs", flex: 1, color: "#888888", wrap: false }),
-        flexText("-", { size: "xs", flex: 4, color: "#888888" }),
-        flexText("ไม่มีไฟล์เอกสารใหม่", { size: "xs", flex: 6, color: "#888888" }),
-      ],
-    });
-  } else {
-    for (const [idx, row] of rows.slice(0, 10).entries()) {
-      bodyContents.push({
-        type: "box",
-        layout: "horizontal",
-        margin: "sm",
-        contents: [
-          flexText(String(idx + 1), { size: "xs", flex: 1, color: "#555555", wrap: false }),
-          flexText(shortText(row.entity, 34), { size: "xs", flex: 4 }),
-          flexText(shortText(row.filename, 64), { size: "xs", flex: 6 }),
-        ],
-      });
-    }
-    if (mailDocStat.count > rows.length) {
-      bodyContents.push({ type: "separator", margin: "sm" });
-      bodyContents.push(flexText(`... และอีก ${mailDocStat.count - rows.length} ไฟล์`, {
-        size: "xs",
-        color: "#888888",
-        align: "center",
-        margin: "sm",
-      }));
-    }
-  }
-
-  return {
-    type: "bubble",
-    size: "giga",
-    header: {
-      type: "box",
-      layout: "vertical",
-      paddingAll: "lg",
-      backgroundColor: "#F5F5F5",
-      contents: [
-        flexText("📥 สรุปการดาวน์โหลดเอกสาร", {
-          weight: "bold",
-          size: "md",
-          color: "#1F1F1F",
-        }),
-        flexText(`📅 ${formatThaiDate(today)}`, {
-          size: "sm",
-          color: "#888888",
-          margin: "sm",
-        }),
-        flexText(countText, {
-          size: "sm",
-          weight: "bold",
-          color: "#0066CC",
-          margin: "sm",
-        }),
-        flexText(`${yesterday} 18:01 → ${today} 18:00 • ${lineDocText}`, {
-          size: "xxs",
-          color: "#888888",
-          margin: "xs",
-        }),
-      ],
-    },
-    body: {
-      type: "box",
-      layout: "vertical",
-      paddingAll: "md",
-      contents: bodyContents,
-    },
-  };
-}
-
-function dailySummaryTotalCount(mailDocStat, lineDocStat) {
-  const mailCount = mailDocStat.ok ? Number(mailDocStat.count || 0) : 0;
-  const lineCount = lineDocStat.ok ? Number(lineDocStat.count || 0) : 0;
-  return mailCount + lineCount;
-}
-
 async function sendDailySummary() {
-  const lineGroups = getLineAttachmentGroups();
+  const lineGroups = getLineAttachmentGroups().filter(group => group.dailySummaryEnabled);
   if (lineGroups.length === 0) return;
 
   // วันที่วันนี้ตามเวลา BKK (สำหรับ period_end_date)
@@ -993,13 +856,6 @@ async function sendDailySummary() {
       fetchDailyStat("line-inbox-stats", today, lineGroup),
       lineGroup.includeMailDocs ? fetchDailyStat("mail-doc-stats", today, lineGroup) : Promise.resolve({ ok: true, count: 0, rows: [] }),
     ]);
-    if (!lineGroup.includeMailDocs && lineDocStat.ok) {
-      mailDocStat = {
-        ...lineDocStat,
-        rows: (lineDocStat.rows || []).map((row) => ({ entity: lineGroup.label, ...row })),
-      };
-    }
-
     if (!lineDocStat.ok && !mailDocStat.ok) {
       console.error(
         `Daily summary skipped (period_end ${today}): ` +
@@ -1014,11 +870,16 @@ async function sendDailySummary() {
       continue;
     }
 
-    await linePushFlex(
-      lineGroup.groupId,
-      `สรุปดาวน์โหลด ${totalCount} ไฟล์ ประจำวันที่ ${formatThaiDate(today)}`,
-      buildDailySummaryFlex(mailDocStat, lineDocStat, today, yesterday)
-    );
+    const messages = buildDailySummaryMessages(mailDocStat, lineDocStat, today, yesterday, lineGroup);
+    // Decorate only the final page; collect balances once for the entire summary.
+    messages.at(-1).contents = await notificationCredit.flex(messages.at(-1).contents);
+    for (let offset = 0; offset < messages.length; offset += 5) {
+      await axios.post(
+        "https://api.line.me/v2/bot/message/push",
+        { to: lineGroup.groupId, messages: messages.slice(offset, offset + 5) },
+        { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
+      );
+    }
     console.log(
       `✓ ส่งสรุปรายวัน (period_end ${today}): ` +
       `mail_docs=${mailDocStat.ok ? mailDocStat.count : "ERR"} ` +
