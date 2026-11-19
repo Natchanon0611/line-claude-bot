@@ -47,7 +47,7 @@ test("failed or incomplete stats are visible, not reported as an empty successfu
 test("empty day has a readable page", () => {
   assert.match(JSON.stringify(buildDailySummaryMessages(empty, empty, ...dates)), /ไม่มีไฟล์ใหม่/);
 });
-function harness({ mail = empty, line = stat(fixtures(1)), sendEmpty = false, failLine = false, failPush = false } = {}) {
+function harness({ mail = empty, line = stat(fixtures(1)), sendEmpty = false, failMail = false, failLine = false, failPush = false } = {}) {
   const entry = path.join(__dirname, "..", "index.js");
   const appRequire = createRequire(entry);
   const pushes = [], gets = [], logs = [];
@@ -57,7 +57,7 @@ function harness({ mail = empty, line = stat(fixtures(1)), sendEmpty = false, fa
       gets.push(url);
       assert.doesNotMatch(url, /ampohm|Camp/);
       if (url.includes("/line-inbox-stats?")) { if (failLine) throw new Error("unavailable"); return { data: line }; }
-      if (url.includes("/mail-doc-stats?")) return { data: mail };
+      if (url.includes("/mail-doc-stats?")) { if (failMail) throw new Error("mail unavailable"); return { data: mail }; }
       throw new Error("Unexpected GET " + url);
     },
     async post(url, body) {
@@ -91,21 +91,58 @@ function harness({ mail = empty, line = stat(fixtures(1)), sendEmpty = false, fa
 }
 test("daily summary sends all FES files; AmpOhm stays available for intake but has no summary calls", async () => {
   const rows = fixtures(1300);
-  const h = harness({ line: stat(rows) });
+  const mail = [{ entity: "Test supplier", filename: "invoice.pdf" }];
+  const h = harness({ mail: stat(mail), line: stat(rows) });
   await h.run();
   assert.ok(h.groups().some(g => g.company === "ampohm"));
   assert.equal(h.gets.length, 2);
   assert.ok(h.pushes.length > 1);
-  assert.deepEqual(filenames(h.pushes.flatMap(p => p.messages)), rows.map(r => r.filename));
+  assert.deepEqual(filenames(h.pushes.flatMap(p => p.messages)), [...mail, ...rows].map(r => r.filename));
   assert.equal(h.decorations(), 1);
 });
-test("empty FES day skips unless explicitly enabled; never sends AmpOhm", async () => {
-  const h = harness({ line: empty });
+test("LINE-only and empty days stay quiet even if SEND_EMPTY is enabled", async () => {
+  for (const line of [empty, stat(fixtures(5))]) {
+    for (const sendEmpty of [false, true]) {
+      const h = harness({ line, sendEmpty });
+      await h.run();
+      assert.equal(h.pushes.length, 0);
+      assert.equal(h.decorations(), 0);
+      assert.ok(h.logs.some(log => log.includes("no confirmed mail downloads")));
+    }
+  }
+});
+test("one downloaded mail file triggers a summary without any LINE files", async () => {
+  const h = harness({ mail: stat([{ filename: "invoice.pdf" }]), line: empty });
   await h.run();
-  assert.equal(h.pushes.length, 0);
-  const enabled = harness({ line: empty, sendEmpty: true });
-  await enabled.run();
-  assert.equal(enabled.pushes.length, 1);
+  assert.equal(h.pushes.length, 1);
+  assert.deepEqual(filenames(h.pushes[0].messages), ["invoice.pdf"]);
+  assert.equal(h.decorations(), 1);
+});
+test("email plus LINE keeps both lists and the correct combined count", async () => {
+  const mail = [{ filename: "invoice.pdf" }, { filename: "quotation.pdf" }];
+  const line = fixtures(1);
+  const h = harness({ mail: stat(mail), line: stat(line) });
+  await h.run();
+  assert.equal(h.pushes.length, 1);
+  assert.deepEqual(filenames(h.pushes[0].messages), [...mail, ...line].map(row => row.filename));
+  assert.match(h.pushes[0].messages[0].altText, /3 ไฟล์/);
+  assert.equal(h.decorations(), 1);
+});
+test("mail lookup failure never triggers a LINE-only or empty summary", async () => {
+  for (const failLine of [false, true]) {
+    const h = harness({ failMail: true, failLine, sendEmpty: true });
+    await h.run();
+    assert.equal(h.pushes.length, 0);
+    assert.equal(h.decorations(), 0);
+  }
+});
+test("invalid mail counts are not interpreted as downloaded files", async () => {
+  for (const count of [-1, 0.5, "1", true, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    const h = harness({ mail: { ok: true, count, rows: [] } });
+    await h.run();
+    assert.equal(h.pushes.length, 0);
+    assert.equal(h.decorations(), 0);
+  }
 });
 test("partial source failure still sends available files with warning", async () => {
   const h = harness({ mail: stat([{ filename: "invoice.pdf" }]), failLine: true });
@@ -114,7 +151,7 @@ test("partial source failure still sends available files with warning", async ()
   assert.match(JSON.stringify(h.pushes), /LINE: ตรวจรายการไม่ได้/);
 });
 test("failed push does not log a successful summary", async () => {
-  const h = harness({ failPush: true });
+  const h = harness({ mail: stat([{ filename: "invoice.pdf" }]), failPush: true });
   await h.run();
   assert.equal(h.pushes.length, 1);
   assert.ok(!h.logs.some(log => log.includes("✓")));

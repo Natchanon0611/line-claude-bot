@@ -156,7 +156,7 @@ test("mail and Auto PO stay plain while the scheduled daily summary includes bal
   const daily = calls[2].messages;
   assert.equal(daily.length, 1);
   assert.equal(daily[0].type, "flex");
-  assert.match(daily[0].altText, /สรุปดาวน์โหลด 3 ไฟล์/);
+  assert.match(daily[0].altText, /สรุปไฟล์ที่ดาวน์โหลด 3 ไฟล์/);
   assert.match(JSON.stringify(daily[0].contents), /PO123.pdf/);
   assert.match(daily[0].contents.footer.contents[0].text, /Claude \(ระบบนับ\): ใช้สะสม/);
   assert.match(daily[0].contents.footer.contents[0].text, /เหลือ ≈377\/500/);

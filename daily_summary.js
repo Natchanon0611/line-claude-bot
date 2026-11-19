@@ -49,7 +49,7 @@ function buildDailySummaryMessages(mail, line, today, yesterday, group = {}) {
     return {
       type: "bubble", size: "giga",
       header: { type: "box", layout: "vertical", paddingAll: "lg", backgroundColor: "#F5F5F5", contents: [
-        text("📥 สรุปไฟล์รายวัน • " + company, { weight: "bold", size: "md" }),
+        text("📥 สรุปไฟล์ที่ดาวน์โหลด • " + company, { weight: "bold", size: "md" }),
         text("📅 " + formatThaiDate(today) + " • หน้า " + pageNo + "/" + pageCount, { size: "sm", color: "#888888", margin: "sm" }),
         text("ทั้งหมด " + total + " ไฟล์" + (warnings.length ? " (ข้อมูลบางส่วนตรวจไม่ได้/ไม่ครบ)" : ""), { size: "sm", weight: "bold", color: "#0066CC", margin: "sm" }),
         text("อีเมล " + (mail.ok ? mail.count : "?") + " • LINE " + (line.ok ? line.count : "?"), { size: "xs", color: "#666666", margin: "xs" }),
@@ -82,7 +82,7 @@ function buildDailySummaryMessages(mail, line, today, yesterday, group = {}) {
     if (!carousel.length) return;
     messages.push({
       type: "flex",
-      altText: "สรุปดาวน์โหลด " + total + " ไฟล์ ประจำวันที่ " + formatThaiDate(today) + " • " + company,
+      altText: "สรุปไฟล์ที่ดาวน์โหลด " + total + " ไฟล์ • " + formatThaiDate(today) + " • " + company,
       contents: carousel.length === 1 ? carousel[0] : { type: "carousel", contents: carousel },
     });
     carousel = [];

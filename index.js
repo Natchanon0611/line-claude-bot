@@ -6,7 +6,7 @@ const crypto = require("crypto");
 const { processWebhookBatch } = require("./webhook_batch");
 const { createCreditDecorator } = require("./notification_credit");
 const { registerLineWebhook } = require("./line_webhook");
-const { buildDailySummaryMessages, dailySummaryTotalCount } = require("./daily_summary");
+const { buildDailySummaryMessages } = require("./daily_summary");
 const app = express();
 
 
@@ -37,7 +37,6 @@ const SLIP_GROUP_ID = process.env.SLIP_GROUP_ID || "";
 const AMPOHM_GROUP_ID = process.env.AMPOHM_GROUP_ID || process.env.APPOM_GROUP_ID || "Cc4af6846c391128bb8500b4f2c1e7860";
 const DOWNLOADABLE_LINE_TYPES = new Set(["image", "file", "video", "audio"]);
 const LINE_DOC_MAX_BYTES = Number(process.env.LINE_DOC_MAX_BYTES || 50 * 1024 * 1024);
-const DAILY_SUMMARY_SEND_EMPTY = String(process.env.DAILY_SUMMARY_SEND_EMPTY || "").toLowerCase() === "true";
 
 function isLineGroupId(id) {
   return typeof id === "string" && id.startsWith("C");
@@ -882,17 +881,14 @@ async function sendDailySummary() {
       fetchDailyStat("line-inbox-stats", today, lineGroup),
       lineGroup.includeMailDocs ? fetchDailyStat("mail-doc-stats", today, lineGroup) : Promise.resolve({ ok: true, count: 0, rows: [] }),
     ]);
-    if (!lineDocStat.ok && !mailDocStat.ok) {
-      console.error(
-        `Daily summary skipped (period_end ${today}): ` +
-        `mail_docs=${mailDocStat.error || "ERR"} line_inbox=${lineDocStat.error || "ERR"}`
-      );
+    // A daily summary requires confirmed downloads from email. LINE-only days
+    // stay quiet, including when the retired SEND_EMPTY setting is still set.
+    if (!mailDocStat.ok) {
+      console.error(`Daily summary deferred company=${lineGroup.company} (period_end ${today}): mail stats unavailable (${mailDocStat.error || "ERR"})`);
       continue;
     }
-
-    const totalCount = dailySummaryTotalCount(mailDocStat, lineDocStat);
-    if (!DAILY_SUMMARY_SEND_EMPTY && totalCount === 0) {
-      console.log(`Daily summary skipped company=${lineGroup.company} (period_end ${today}): no loaded documents`);
+    if (!Number.isSafeInteger(mailDocStat.count) || mailDocStat.count <= 0) {
+      console.log(`Daily summary skipped company=${lineGroup.company} (period_end ${today}): no confirmed mail downloads`);
       continue;
     }
 
