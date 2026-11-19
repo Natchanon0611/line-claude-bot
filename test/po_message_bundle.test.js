@@ -300,3 +300,18 @@ test('mail results remain a separate text-only message', async () => {
   assert.deepEqual(h.pushes[0].messages.map(m => m.type), ['text']);
   assert.match(h.pushes[0].messages[0].text, /สรุปส่งเมลยืนยัน PO/);
 });
+
+test('quotation failures and review candidates are not reported as missing files', async () => {
+  for (const status of ['error', 'review_required']) {
+    const h = harness();
+    await h.sign({ status: 'success', signed: [{ ...po,
+      quotation_match_status: status,
+      quotation_match_reason: 'revision / รายการ / ยอดเงินต้องตรวจยืนยัน',
+      quotation_candidates: ['FFT26089Rev.2.pdf'],
+    }] }, 'tester', 'Ctest');
+    const text = h.pushes[0].messages[0].text;
+    assert.doesNotMatch(text, /ไม่พบที่ตรงกัน/);
+    assert.match(text, status === 'error' ? /ระบบจับคู่ผิดพลาด/ : /รอตรวจยืนยัน[\s\S]*FFT26089Rev.2.pdf/);
+    assert.equal(h.pushes.length, 1);
+  }
+});

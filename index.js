@@ -298,6 +298,12 @@ async function processPOSignResult(data, senderName, notifyId) {
                       : item.matched_confidence === "medium" ? "🟡"
                       : item.matched_confidence === "low"    ? "🔴" : "⚪";
       quotationLine = `📋 ใบเสนอราคา: ${poMessageField(item.matched_quotation)}\n   ${confEmoji} ความมั่นใจ: ${poMessageField(item.matched_confidence || "?", 30)}\n`;
+    } else if (!data.dry_run && item.quotation_match_status === "error") {
+      quotationLine = `📋 ใบเสนอราคา: ระบบจับคู่ผิดพลาด ต้องตรวจหรือลองใหม่ ⚠️\n   ${poMessageField(item.quotation_match_reason || "อ่านผลจับคู่ไม่สำเร็จ", 400)}\n`;
+    } else if (!data.dry_run && item.quotation_match_status === "review_required") {
+      const candidates = (Array.isArray(item.quotation_candidates) ? item.quotation_candidates : []).slice(0, 3);
+      quotationLine = `📋 ใบเสนอราคา: พบเอกสารที่เกี่ยวข้อง รอตรวจยืนยัน ⚠️\n   ${poMessageField(item.quotation_match_reason || "revision / รายการ / ยอดเงินต้องตรวจยืนยัน", 500)}\n`;
+      if (candidates.length) quotationLine += `   เอกสารที่ต้องตรวจ: ${poMessageField(candidates.join("; "), 400)}\n`;
     } else {
       quotationLine = data.dry_run ? "📋 ใบเสนอราคา: โหมดทดสอบยังไม่จับคู่\n" : "📋 ใบเสนอราคา: ไม่พบที่ตรงกันใน NAS ⚠️\n";
     }
@@ -1086,6 +1092,7 @@ const PO_SIGN_STATUSES = new Set(["success", "partial_failed", "partial_success"
 app.get("/po-sign-result-capabilities", (req, res) => {
   if (req.headers["x-po-secret"] !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
   return res.json({ protocol: PO_SIGN_RESULT_PROTOCOL, textAndImage: true, previewFallback: true,
+    quotationStatuses: ["matched", "not_found", "review_required", "error"],
     statuses: [...PO_SIGN_STATUSES], revision: process.env.RENDER_GIT_COMMIT || null });
 });
 app.post("/po-sign-result", async (req, res) => {
