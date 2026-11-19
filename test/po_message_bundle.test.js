@@ -23,11 +23,12 @@ function harness({ signed = [po], result, target = 'Ctest', failPush = false, co
       if (url.endsWith('/credit-status')) return { data: {} };
       throw new Error(`Unexpected GET: ${url}`);
     },
-    async post(url, body) {
-      calls.push({ url, body });
+    async post(url, body, options) {
+      calls.push({ url, body, options });
       if (url === 'https://api.line.me/v2/bot/message/push') {
         pushes.push(JSON.parse(JSON.stringify(body)));
-        if (failPush) throw Object.assign(new Error('monthly limit'), { response: { status: 429 } });
+        if (typeof failPush === 'function') { const error = failPush(pushes.length); if (error) throw error; }
+        else if (failPush) throw Object.assign(new Error('monthly limit'), { response: { status: 429 } });
         return { data: {} };
       }
       if (url === 'https://local.invalid/sign-po') return { data: result || { status: 'success', signed } };
@@ -314,4 +315,45 @@ test('quotation failures and review candidates are not reported as missing files
     assert.match(text, status === 'error' ? /ระบบจับคู่ผิดพลาด/ : /รอตรวจยืนยัน[\s\S]*FFT26089Rev.2.pdf/);
     assert.equal(h.pushes.length, 1);
   }
+});
+
+
+test('durable relay retries identical content and treats LINE accepted retry as delivered', async () => {
+  const h = harness({ failPush: count => count === 2
+    ? Object.assign(new Error('accepted retry'), { response: { status: 409, headers: {'x-line-accepted-request-id': 'first'} } }) : null });
+  const notification = {id:'123e4567-e89b-42d3-a456-426614174000',created_at:1800000000,target:'Ctest'};
+  const body = {result:{status:'success',signed:[{...po,signed_pages:[2],page_images:[{...po,page:2}]}]},notification};
+  assert.equal((await h.route('/po-sign-result',body)).body.status,'ok');
+  assert.equal((await h.route('/po-sign-result',body)).body.status,'ok');
+  assert.deepEqual(h.pushes[0],h.pushes[1]);
+  const requests=h.calls.filter(x=>x.url.endsWith('/message/push'));
+  assert.equal(requests[0].options.headers['X-Line-Retry-Key'],requests[1].options.headers['X-Line-Retry-Key']);
+  assert.match(requests[0].options.headers['X-Line-Retry-Key'],/^[a-f0-9-]{36}$/);
+  assert.match(h.pushes[0].messages[0].text,/หน้าที่เซ็น: 2/);
+});
+
+test('all signed pages are included within LINE five-message limit', async () => {
+  const h=harness();
+  const images=Array.from({length:7},(_,i)=>({...po,page:i+1}));
+  await h.route('/po-sign-result',{result:{status:'success',signed:[{...po,page_images:images,signed_pages:[1,2,3,4,5,6,7]}]},
+    notification:{id:'123e4567-e89b-42d3-a456-426614174001',created_at:1800000000,target:'Ctest'}});
+  assert.equal(h.pushes.length,2);
+  assert.equal(h.pushes.flatMap(x=>x.messages).filter(x=>x.type==='image').length,7);
+  assert.ok(h.pushes.every(x=>x.messages.length<=5));
+  const keys=h.calls.filter(x=>x.url.endsWith('/message/push')).map(x=>x.options.headers['X-Line-Retry-Key']);
+  assert.notEqual(keys[0],keys[1]);
+});
+
+test('changing a durable notification target requires review and never pushes', async () => {
+  const h=harness();
+  const result=await h.route('/po-sign-result',{result:{status:'success',signed:[po]},
+    notification:{id:'123e4567-e89b-42d3-a456-426614174000',created_at:1800000000,target:'Cother'}});
+  assert.equal(result.statusCode,409);assert.equal(h.pushes.length,0);
+});
+
+test('409 without accepted-request evidence is not counted as delivered', async () => {
+  const h=harness({failPush:()=>Object.assign(new Error('unrelated conflict'),{response:{status:409,headers:{}}})});
+  const result=await h.route('/po-sign-result',{result:{status:'success',signed:[po]},
+    notification:{id:'123e4567-e89b-42d3-a456-426614174000',created_at:1800000000,target:'Ctest'}});
+  assert.equal(result.body.status,'line_push_failed');
 });

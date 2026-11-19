@@ -2,6 +2,7 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { processWebhookBatch } = require("./webhook_batch");
 const { createCreditDecorator } = require("./notification_credit");
 const { registerLineWebhook } = require("./line_webhook");
@@ -104,8 +105,9 @@ function scheduleImageCacheRemoval(id, remainingMs = IMAGE_CACHE_TTL_MS) {
   }, delayMs);
 }
 
-function storePoImage(imageB64, previewB64 = "") {
-  const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+function storePoImage(imageB64, previewB64 = "", stable = false) {
+  const id = stable ? crypto.createHash("sha256").update(imageB64 + ":" + previewB64).digest("hex")
+                    : `${Date.now()}_${Math.random().toString(36).slice(2)}`;
   imageStore.set(id, { original: imageB64, preview: previewB64 || imageB64 });
   try {
     writeImageCacheFile(id, "original", imageB64);
@@ -161,25 +163,38 @@ async function lineReply(replyToken, text) {
   );
 }
 
-async function linePush(to, text, credit, poImage) {
-  if (!isLineGroupId(to)) {
-    console.warn(`[LINE] blocked push to non-group target: ${to || "EMPTY"}`);
-    return { skipped: true, reason: "non_group_target" };
-  }
+function notificationRetryKey(value) {
+  const bytes = crypto.createHash("sha256").update(value).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+
+async function linePush(to, text, credit, poImage, retryBase = "") {
+  if (!isLineGroupId(to)) return { skipped: true, reason: "non_group_target" };
   const decorated = await notificationCredit.text(text, credit);
   const messages = [{ type: "text", text: decorated }];
-  const originalImage = poImage?.image_b64 || poImage?.preview_b64;
-  if (originalImage) {
-    const id = storePoImage(originalImage, poImage.preview_b64);
+  const pages = Array.isArray(poImage?.page_images) && poImage.page_images.length
+    ? poImage.page_images : poImage ? [poImage] : [];
+  for (const page of pages) {
+    const original = page.image_b64 || page.preview_b64;
+    if (!original) continue;
+    const id = storePoImage(original, page.preview_b64 || "", Boolean(retryBase));
     const urls = poImageUrls(id);
     messages.push({ type: "image", originalContentUrl: urls.original, previewImageUrl: urls.preview });
   }
-  // LINE charges per recipient per request: keep the PO text and image together.
-  await axios.post(
-    "https://api.line.me/v2/bot/message/push",
-    { to, messages },
-    { headers: { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" } }
-  );
+  for (let offset = 0; offset < messages.length; offset += 5) {
+    const headers = { Authorization: `Bearer ${LINE_TOKEN}`, "Content-Type": "application/json" };
+    if (retryBase) headers["X-Line-Retry-Key"] = notificationRetryKey(`${retryBase}:${offset}`);
+    try {
+      await axios.post("https://api.line.me/v2/bot/message/push",
+        { to, messages: messages.slice(offset, offset + 5) }, { headers, timeout: 20000 });
+    } catch (error) {
+      // A duplicate key is proof of acceptance only with LINE's acceptance ID.
+      if (!(retryBase && error.response?.status === 409 && error.response?.headers?.["x-line-accepted-request-id"])) throw error;
+    }
+  }
 }
 
 async function linePushFlex(to, altText, contents) {
@@ -240,12 +255,15 @@ function poMessageField(value, limit = 200) {
   return text.length > limit ? text.slice(0, limit - 1) + "…" : text;
 }
 
-async function processPOSignResult(data, senderName, notifyId) {
+async function processPOSignResult(data, senderName, notifyId, notification = {}) {
+  let sequence = 0;
   const delivery = { sent: 0, failed: 0 };
   senderName = poMessageField(senderName, 80);
   const send = async (text, credit = data.credit, poImage) => {
+    const ordinal = sequence++;
     try {
-      const result = await linePush(notifyId, text, credit, poImage);
+      const result = await linePush(notifyId, text, credit, poImage,
+        notification.id ? `${notification.id}:${ordinal}` : "");
       if (result?.skipped) delivery.failed += 1;
       else delivery.sent += 1;
     } catch (e) {
@@ -269,7 +287,7 @@ async function processPOSignResult(data, senderName, notifyId) {
     await send("⚠️ " + poMessageField(data.message || "เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ", 1000));
   }
 
-  const now = new Date().toLocaleString("th-TH", {
+  const now = new Date(notification.created_at ? notification.created_at * 1000 : Date.now()).toLocaleString("th-TH", {
     timeZone: "Asia/Bangkok", year: "numeric", month: "2-digit", day: "2-digit",
     hour: "2-digit", minute: "2-digit"
   });
@@ -321,7 +339,9 @@ async function processPOSignResult(data, senderName, notifyId) {
     const fileLine  = item.output_file ? `📄 ไฟล์: ${poMessageField(item.output_file)}\n` : "";
     const waitingLine = !data.dry_run && item.output_file?.startsWith("W-")
                     ? "⏳ สถานะ: รอตรวจ ก่อนส่งเมลยืนยัน\n" : "";
-    const imageLine = item.image_b64 || item.preview_b64 ? "" : "🖼️ ภาพตัวอย่าง: ไม่พร้อมใช้งาน\n";
+    const imageLine = item.signed_pages?.length
+      ? `🖼️ หน้าที่เซ็น: ${item.signed_pages.join(", ")}\n`
+      : item.image_b64 || item.preview_b64 ? "" : "🖼️ ภาพตัวอย่าง: ไม่พร้อมใช้งาน\n";
 
     await send(
       `✅ เซ็น PO เสร็จแล้ว\n━━━━━━━━━━━━━━━\n` +
@@ -1093,10 +1113,11 @@ app.get("/po-sign-result-capabilities", (req, res) => {
   if (req.headers["x-po-secret"] !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
   return res.json({ protocol: PO_SIGN_RESULT_PROTOCOL, textAndImage: true, previewFallback: true,
     quotationStatuses: ["matched", "not_found", "review_required", "error"],
+    durableRetry: true, signedPageImages: true, notificationTarget: getNotifyTarget(),
     statuses: [...PO_SIGN_STATUSES], revision: process.env.RENDER_GIT_COMMIT || null });
 });
 app.post("/po-sign-result", async (req, res) => {
-  const { secret, result } = req.body || {};
+  const { secret, result, notification } = req.body || {};
   if (secret !== PO_SECRET) return res.status(401).json({ error: "Unauthorized" });
   const isObject = (value) => value && typeof value === "object" && !Array.isArray(value);
   if (!isObject(result) || !PO_SIGN_STATUSES.has(result.status) ||
@@ -1106,8 +1127,12 @@ app.post("/po-sign-result", async (req, res) => {
   }
   const notifyTarget = getNotifyTarget();
   if (!notifyTarget) return res.json({ status: "no_target", protocol: PO_SIGN_RESULT_PROTOCOL });
+  if (notification && (!/^[a-f0-9-]{36}$/i.test(notification.id || "") ||
+      !Number.isFinite(notification.created_at) || notification.created_at <= 0 || notification.target !== notifyTarget)) {
+    return res.status(409).json({ error: "Notification identity/target changed; manual review required" });
+  }
   try {
-    const delivery = await processPOSignResult(result, "ระบบ Auto-Sign", notifyTarget);
+    const delivery = await processPOSignResult(result, "ระบบ Auto-Sign", notifyTarget, notification || {});
     return res.json({ status: delivery.failed ? "line_push_failed" : "ok", protocol: PO_SIGN_RESULT_PROTOCOL, ...delivery });
   } catch (err) {
     console.error("[PO-SIGN-RESULT] failed:", err.message);
