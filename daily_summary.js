@@ -17,13 +17,18 @@ function dailySummaryTotalCount(mail, line) {
 function buildDailySummaryMessages(mail, line, today, yesterday, group = {}) {
   const rows = [];
   const warnings = [];
+  let lineImageCount = 0;
   for (const [stat, label] of [[mail, "อีเมล"], [line, "LINE"]]) {
     if (!stat.ok) {
       warnings.push(label + ": ตรวจรายการไม่ได้ชั่วคราว");
       continue;
     }
     const sourceRows = Array.isArray(stat.rows) ? stat.rows : [];
-    rows.push(...sourceRows.map(row => ({ ...row, source: label })));
+    for (const row of sourceRows) {
+      // LINE images/slips contribute to totals, but do not occupy list rows.
+      if (label === "LINE" && row.message_type === "image") lineImageCount++;
+      else rows.push({ ...row, source: label });
+    }
     if (Number(stat.count || 0) !== sourceRows.length) {
       warnings.push(label + ": ได้รายชื่อ " + sourceRows.length + " จาก " + stat.count + " ไฟล์ — ข้อมูลยังไม่ครบ");
     }
@@ -34,7 +39,7 @@ function buildDailySummaryMessages(mail, line, today, yesterday, group = {}) {
   function bubble(pageRows, offset, pageNo, pageCount) {
     const body = warnings.map(message => text(message, { size: "xs", color: "#B00020", margin: "sm" }));
     if (!pageRows.length && !warnings.length) {
-      body.push(text("ไม่มีไฟล์ใหม่ในช่วงเวลานี้", { size: "sm", color: "#888888" }));
+      body.push(text(lineImageCount ? "ไม่มีไฟล์อื่นในช่วงเวลานี้" : "ไม่มีไฟล์ใหม่ในช่วงเวลานี้", { size: "sm", color: "#888888" }));
     }
     pageRows.forEach((row, idx) => {
       const detail = row.source === "อีเมล" ? row.entity || "-" : types[row.message_type] || "ไฟล์";
@@ -53,6 +58,7 @@ function buildDailySummaryMessages(mail, line, today, yesterday, group = {}) {
         text("📅 " + formatThaiDate(today) + " • หน้า " + pageNo + "/" + pageCount, { size: "sm", color: "#888888", margin: "sm" }),
         text("ทั้งหมด " + total + " ไฟล์" + (warnings.length ? " (ข้อมูลบางส่วนตรวจไม่ได้/ไม่ครบ)" : ""), { size: "sm", weight: "bold", color: "#0066CC", margin: "sm" }),
         text("อีเมล " + (mail.ok ? mail.count : "?") + " • LINE " + (line.ok ? line.count : "?"), { size: "xs", color: "#666666", margin: "xs" }),
+        ...(lineImageCount ? [text("รูปภาพ/สลิป LINE " + lineImageCount + " ไฟล์", { size: "xs", color: "#666666", margin: "xs" })] : []),
         text(yesterday + " 18:01 → " + today + " 18:00", { size: "xxs", color: "#888888", margin: "xs" }),
       ] },
       body: { type: "box", layout: "vertical", paddingAll: "md", contents: body },

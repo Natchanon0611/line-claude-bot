@@ -14,18 +14,41 @@ function bubbles(messages) {
 function filenames(messages) {
   return bubbles(messages).flatMap(b => b.body.contents.filter(c => c.type === "box").map(c => c.contents[1].text));
 }
-function fixtures(n, prefix = "slip") {
-  return Array.from({ length: n }, (_, i) => ({ filename: prefix + "-" + i + "-สลิปโอนเงิน.jpg", message_type: "image" }));
+function fixtures(n, prefix = "document") {
+  return Array.from({ length: n }, (_, i) => ({ filename: prefix + "-" + i + "-เอกสาร.pdf", message_type: "file" }));
 }
-test("all email and LINE filenames appear once including over ten images and full long names", () => {
-  const mail = [{ entity: "ลูกค้า", filename: "ใบสั่งซื้อ".repeat(18) + ".pdf" }, ...fixtures(12, "mail")];
+const imageFixtures = n => Array.from({ length: n }, (_, i) => ({ filename: "line-slip-" + i + ".jpg", message_type: "image" }));
+test("email attachments and other LINE filenames appear once with full long names", () => {
+  const mail = [{ entity: "ลูกค้า", filename: "ใบสั่งซื้อ".repeat(18) + ".pdf" }, ...imageFixtures(12)];
   const line = fixtures(23);
   const messages = buildDailySummaryMessages(stat(mail), stat(line), ...dates, { label: "FES" });
   assert.deepEqual(filenames(messages), [...mail, ...line].map(r => r.filename));
   assert.match(JSON.stringify(messages), /อีเมล/);
-  assert.match(JSON.stringify(messages), /รูปภาพ\/สลิป/);
+  assert.doesNotMatch(JSON.stringify(messages), /รูปภาพ\/สลิป LINE/);
   assert.match(messages[0].altText, /36 ไฟล์/);
   assert.equal(bubbles(messages).length, 5);
+});
+test("LINE images/slips use a count without filename rows or extra pages", () => {
+  const images = imageFixtures(1300);
+  const lineFiles = [{ filename: "invoice.pdf", message_type: "file" },
+    { filename: "photo-attachment.jpg", message_type: "file" },
+    { filename: "unknown.jpg" }, { filename: "video.mp4", message_type: "video" },
+    { filename: "audio.m4a", message_type: "audio" }];
+  const mail = [{ filename: "Desktop.zip", entity: "ลีสซิ่งกสิกรไทย" }];
+  const messages = buildDailySummaryMessages(stat(mail), stat([...images, ...lineFiles]), ...dates);
+  assert.deepEqual(filenames(messages), [...mail, ...lineFiles].map(row => row.filename));
+  assert.equal(bubbles(messages).length, 1);
+  assert.match(JSON.stringify(messages), /รูปภาพ\/สลิป LINE 1300 ไฟล์/);
+  assert.match(JSON.stringify(messages), /อีเมล 1 • LINE 1305/);
+  assert.doesNotMatch(JSON.stringify(messages), /line-slip-|ข้อมูลยังไม่ครบ/);
+  assert.match(messages[0].altText, /1306 ไฟล์/);
+  const numbers = bubbles(messages)[0].body.contents.filter(c => c.type === "box").map(c => c.contents[0].text.split(".")[0]);
+  assert.deepEqual(numbers, ["1", "2", "3", "4", "5", "6"]);
+
+  const onlyImages = buildDailySummaryMessages(empty, stat(images), ...dates);
+  assert.deepEqual(filenames(onlyImages), []);
+  assert.match(JSON.stringify(onlyImages), /รูปภาพ\/สลิป LINE 1300 ไฟล์/);
+  assert.doesNotMatch(JSON.stringify(onlyImages), /ไม่มีไฟล์ใหม่/);
 });
 test("large Thai file lists fit LINE limits without truncation", () => {
   const rows = fixtures(1300).map(r => ({ ...r, filename: r.filename + "ก".repeat(230) }));
@@ -39,10 +62,11 @@ test("large Thai file lists fit LINE limits without truncation", () => {
   for (const b of bubbles(messages)) assert.ok(Buffer.byteLength(JSON.stringify(b)) < 26000);
 });
 test("failed or incomplete stats are visible, not reported as an empty successful list", () => {
-  const messages = buildDailySummaryMessages({ ok: false }, { ok: true, count: 3, rows: fixtures(1) }, ...dates);
+  const messages = buildDailySummaryMessages({ ok: false }, { ok: true, count: 3, rows: imageFixtures(1) }, ...dates);
   assert.match(JSON.stringify(messages), /อีเมล: ตรวจรายการไม่ได้/);
   assert.match(JSON.stringify(messages), /ได้รายชื่อ 1 จาก 3/);
-  assert.deepEqual(filenames(messages), fixtures(1).map(r => r.filename));
+  assert.deepEqual(filenames(messages), []);
+  assert.match(JSON.stringify(messages), /รูปภาพ\/สลิป LINE 1 ไฟล์/);
 });
 test("empty day has a readable page", () => {
   assert.match(JSON.stringify(buildDailySummaryMessages(empty, empty, ...dates)), /ไม่มีไฟล์ใหม่/);
@@ -89,7 +113,7 @@ function harness({ mail = empty, line = stat(fixtures(1)), sendEmpty = false, fa
   return { pushes, gets, logs, decorations: () => decorations, run: () => vm.runInContext("sendDailySummary()", context),
     groups: () => vm.runInContext("getLineAttachmentGroups()", context) };
 }
-test("daily summary sends all FES files; AmpOhm stays available for intake but has no summary calls", async () => {
+test("daily summary paginates other FES files; AmpOhm stays available for intake but has no summary calls", async () => {
   const rows = fixtures(1300);
   const mail = [{ entity: "Test supplier", filename: "invoice.pdf" }];
   const h = harness({ mail: stat(mail), line: stat(rows) });
@@ -101,7 +125,7 @@ test("daily summary sends all FES files; AmpOhm stays available for intake but h
   assert.equal(h.decorations(), 1);
 });
 test("LINE-only and empty days stay quiet even if SEND_EMPTY is enabled", async () => {
-  for (const line of [empty, stat(fixtures(5))]) {
+  for (const line of [empty, stat(fixtures(5)), stat(imageFixtures(5))]) {
     for (const sendEmpty of [false, true]) {
       const h = harness({ line, sendEmpty });
       await h.run();
@@ -118,14 +142,16 @@ test("one downloaded mail file triggers a summary without any LINE files", async
   assert.deepEqual(filenames(h.pushes[0].messages), ["invoice.pdf"]);
   assert.equal(h.decorations(), 1);
 });
-test("email plus LINE keeps both lists and the correct combined count", async () => {
-  const mail = [{ filename: "invoice.pdf" }, { filename: "quotation.pdf" }];
-  const line = fixtures(1);
+test("one email file plus five LINE slips lists only the email and keeps all six in totals", async () => {
+  const mail = [{ filename: "Desktop.zip" }];
+  const line = imageFixtures(5);
   const h = harness({ mail: stat(mail), line: stat(line) });
   await h.run();
   assert.equal(h.pushes.length, 1);
-  assert.deepEqual(filenames(h.pushes[0].messages), [...mail, ...line].map(row => row.filename));
-  assert.match(h.pushes[0].messages[0].altText, /3 ไฟล์/);
+  assert.deepEqual(filenames(h.pushes[0].messages), ["Desktop.zip"]);
+  assert.match(h.pushes[0].messages[0].altText, /6 ไฟล์/);
+  assert.match(JSON.stringify(h.pushes), /รูปภาพ\/สลิป LINE 5 ไฟล์/);
+  assert.doesNotMatch(JSON.stringify(h.pushes), /line-slip-/);
   assert.equal(h.decorations(), 1);
 });
 test("mail lookup failure never triggers a LINE-only or empty summary", async () => {
